@@ -90,9 +90,9 @@ div[data-testid="stAlert"], div[data-testid="stAlert"] * {{ color:#0A0A0A !impor
 with st.sidebar:
     st.image("pas_logo.png", use_column_width=True)
     st.markdown("""
-    <div class="pas-sidebar-title">PAS Vendor Hire<br>Report Checker</div>
+    <div class="pas-sidebar-title">PAS Vendor<br>On-Hire Checker</div>
     <div class="pas-yellow-line"></div>
-    <div class="pas-sidebar-copy">Upload a vendor hire report and the PAS Material & Plant Orders spreadsheet, then export a checked Excel report.</div>
+    <div class="pas-sidebar-copy">Upload a vendor hire report and the PAS Material & Plant Orders spreadsheet, then check whether each chargeable item is still live on hire.</div>
     <div class="pas-sidebar-rule"></div>
     <div class="pas-sidebar-heading">Instructions</div>
     <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 16l-4-4-4 4"/><path d="M12 12v9"/><path d="M20 16.6A5 5 0 0 0 18 7h-1.3A8 8 0 1 0 4 15.3"/></svg></span><span>Upload Vendor Hire Report</span></div>
@@ -104,7 +104,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 st.markdown("""
-<div class="pas-hero"><div class="pas-hero-logo">PAS</div><div class="pas-hero-text">PAS Vendor Hire Report Checker<span class="pas-hero-dot">•</span><span class="pas-hero-version">v1.0 Prototype Build</span></div></div>
+<div class="pas-hero"><div class="pas-hero-logo">PAS</div><div class="pas-hero-text">PAS Vendor On-Hire Checker<span class="pas-hero-dot">•</span><span class="pas-hero-version">v1.0 Prototype Build</span></div></div>
 """, unsafe_allow_html=True)
 
 # ---------- helpers ----------
@@ -264,45 +264,71 @@ def load_pas_plant(uploaded_file) -> pd.DataFrame:
     return out
 
 # ---------- matching ----------
+def pas_is_live(status: str) -> bool:
+    status_text = clean_cell(status).lower().strip()
+    return status_text in {"on hire", "missing"}
+
+def pas_is_off_hired(status: str) -> bool:
+    status_text = clean_cell(status).lower().strip()
+    return "off" in status_text and "hire" in status_text
+
 def score_candidate(vrow, prow) -> Tuple[float, List[str]]:
+    """Score likely PAS matches. Price is deliberately ignored.
+
+    The goal is only to decide whether the vendor line is still live on the
+    PAS Materials & Plant report. Fleet helps confidence, but a fleet mismatch
+    does not fail the line.
+    """
     reasons = []
     score = 0.0
+
     desc_score = similarity(vrow.get("Vendor Description", ""), prow.get("PAS Description", ""))
     score += desc_score * 65
-    if desc_score >= 0.88: reasons.append("Strong description match")
-    elif desc_score >= 0.72: reasons.append("Possible description match")
+    if desc_score >= 0.88:
+        reasons.append("Strong description match")
+    elif desc_score >= 0.72:
+        reasons.append("Possible description match")
 
     vjob = job_base(vrow.get("Vendor Job", ""))
     pjob = job_base(prow.get("PAS Job No", ""))
     if vjob and pjob and vjob == pjob:
-        score += 20; reasons.append("Job matches")
+        score += 22
+        reasons.append("Job matches")
 
+    # Vendor reports commonly show P114/H4767. The H number is the PAS order.
     vhire = clean_cell(vrow.get("Vendor Hire No", "")).upper()
     phire = clean_cell(prow.get("PAS Order Number", "")).upper()
     if vhire and phire and vhire == phire:
-        score += 25; reasons.append("Order number matches")
+        score += 32
+        reasons.append("Order number matches")
 
     vfleet = clean_cell(vrow.get("Vendor Fleet No", "")).upper()
     pfleet = clean_cell(prow.get("PAS Fleet No", "")).upper()
     if vfleet and pfleet and vfleet == pfleet:
-        score += 8; reasons.append("Fleet matches")
+        score += 8
+        reasons.append("Fleet matches")
+
     return score, reasons
 
 def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     results = []
     ignored = []
+
     for _, vrow in vendor_df.iterrows():
         rate = vrow.get("Vendor Rate Value")
         if rate is not None and abs(float(rate)) < 0.005:
-            row = vrow.to_dict(); row["Status"] = "Ignored"; row["Reason"] = "£0 cost/rate ignored"
-            ignored.append(row); continue
-        if rate is None:
-            # Keep blank-rate items in the check because some reports show FOC extras with blank rates.
-            pass
+            row = vrow.to_dict()
+            row["Status"] = "Ignored"
+            row["Reason"] = "£0 cost/rate ignored"
+            row["Colour"] = "Grey"
+            ignored.append(row)
+            continue
 
         candidates = []
         for _, prow in pas_df.iterrows():
             s, rs = score_candidate(vrow, prow)
+            # Keep this fairly low because descriptions vary supplier-to-supplier,
+            # but PO/job/order number will push real matches to the top.
             if s >= 35:
                 candidates.append((s, rs, prow))
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -313,39 +339,38 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
         reason = "No matching item found on PAS report"
         match_score = 0
         prow = None
+
         if best:
             match_score, reason_bits, prow = best
             desc_score = similarity(vrow.get("Vendor Description", ""), prow.get("PAS Description", ""))
             reason = "; ".join(reason_bits) or "Best match found"
+
             v_fleet = clean_cell(vrow.get("Vendor Fleet No", "")).upper()
             p_fleet = clean_cell(prow.get("PAS Fleet No", "")).upper()
             fleet_mismatch = bool(v_fleet and p_fleet and v_fleet != p_fleet)
-            status_text = clean_cell(prow.get("PAS Status", "")).lower()
-            pas_desc = clean_cell(prow.get("PAS Description", "")).lower()
+            status_text = clean_cell(prow.get("PAS Status", ""))
+            status_low = status_text.lower()
+            pas_desc_low = clean_cell(prow.get("PAS Description", "")).lower()
 
-            if "operated plant" in status_text or "operated plant" in pas_desc:
+            if "operated plant" in status_low or "operated plant" in pas_desc_low:
                 status, colour, reason = "Query", "Red", "Operated plant item - manual review required"
-            elif "off" in status_text and "hire" in status_text:
-                status, colour, reason = "Query", "Red", "PAS item appears off-hired but still appears on vendor report"
+            elif pas_is_off_hired(status_text):
+                status, colour, reason = "Query", "Red", "PAS item is off-hired but still appears on vendor report"
+            elif not pas_is_live(status_text):
+                status, colour, reason = "Query", "Red", f"PAS status is '{status_text or 'blank'}' - not live on hire"
             elif match_score >= 72 and desc_score >= 0.72:
                 if fleet_mismatch:
                     status, colour = "Warning", "Orange"
-                    reason = reason + "; Fleet mismatch only"
+                    reason = reason + "; Fleet mismatch only - item still appears live on PAS"
                 else:
                     status, colour = "Matched", "Green"
+                    reason = reason + "; Item still live on PAS"
             elif match_score >= 55 and desc_score >= 0.62:
                 status, colour = "Warning", "Orange"
-                reason = reason + "; Possible fuzzy match - review"
+                reason = reason + "; Possible fuzzy match - PAS item appears live, review wording"
             else:
                 status, colour = "Query", "Red"
                 reason = "Weak match only - manual review required"
-
-            # Rate check: vendor weekly rate should broadly match PAS weekly cost where available.
-            pas_rate = money_to_float(prow.get("PAS Weekly Cost", None)) if prow is not None else None
-            if status in {"Matched", "Warning"} and rate is not None and pas_rate is not None and pas_rate > 0:
-                if abs(float(rate) - float(pas_rate)) > 0.05:
-                    status, colour = "Query", "Red"
-                    reason = f"Rate discrepancy: vendor £{float(rate):.2f} vs PAS £{float(pas_rate):.2f}"
 
         out = vrow.to_dict()
         out.update({
@@ -357,7 +382,6 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
             "PAS Fleet No": clean_cell(prow.get("PAS Fleet No", "")) if prow is not None else "",
             "PAS Supplier": clean_cell(prow.get("PAS Supplier", "")) if prow is not None else "",
             "PAS Qty": clean_cell(prow.get("PAS Qty", "")) if prow is not None else "",
-            "PAS Weekly Cost": clean_cell(prow.get("PAS Weekly Cost", "")) if prow is not None else "",
             "PAS On Hire Date": format_date(prow.get("PAS On Hire Date", "")) if prow is not None else "",
             "PAS Off Hire Date": format_date(prow.get("PAS Off Hire Date", "")) if prow is not None else "",
             "PAS Status": clean_cell(prow.get("PAS Status", "")) if prow is not None else "",
@@ -365,6 +389,7 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
             "PAS Order Number": clean_cell(prow.get("PAS Order Number", "")) if prow is not None else "",
         })
         results.append(out)
+
     return pd.DataFrame(results), pd.DataFrame(ignored)
 
 # ---------- excel output ----------
@@ -411,7 +436,7 @@ def make_excel(results_df: pd.DataFrame, ignored_df: pd.DataFrame, summary_df: p
     cols = [
         "Status", "Reason", "Vendor Site", "Vendor Fleet No", "Vendor Description", "Vendor Qty", "Vendor On Hire Date",
         "Vendor Contract No", "Vendor Order No", "Vendor Rate", "Vendor Rate Value", "Match Score",
-        "PAS Description", "PAS Fleet No", "PAS Supplier", "PAS Qty", "PAS Weekly Cost", "PAS On Hire Date", "PAS Off Hire Date", "PAS Status", "PAS Job No", "PAS Order Number", "Colour"
+        "PAS Description", "PAS Fleet No", "PAS Supplier", "PAS Qty", "PAS On Hire Date", "PAS Off Hire Date", "PAS Status", "PAS Job No", "PAS Order Number", "Colour"
     ]
     export = results_df.copy()
     for c in cols:
@@ -464,7 +489,7 @@ if run:
             raw_vendor, vendor_df = load_vendor_report(vendor_file)
         with st.spinner("Reading PAS Materials & Plant Orders..."):
             pas_df = load_pas_plant(pas_file)
-        with st.spinner("Matching vendor report against PAS report..."):
+        with st.spinner("Checking whether vendor items are still live on PAS report..."):
             results_df, ignored_df = reconcile(vendor_df, pas_df)
         total_checked = len(results_df)
         matched = int((results_df["Status"] == "Matched").sum()) if not results_df.empty else 0
@@ -472,20 +497,16 @@ if run:
         queries = int((results_df["Status"] == "Query").sum()) if not results_df.empty else 0
         ignored = len(ignored_df)
         match_pct = round((matched / total_checked) * 100, 1) if total_checked else 0.0
-        weekly_saving = 0.0
-        if not results_df.empty:
-            mask = results_df["Reason"].astype(str).str.contains("off-hired", case=False, na=False)
-            weekly_saving = results_df.loc[mask, "Vendor Rate Value"].fillna(0).astype(float).sum()
         summary_df = pd.DataFrame({
-            "Metric": ["Total chargeable lines checked", "Matched lines", "Warnings", "Queries", "Ignored £0 lines", "Match percentage", "Potential weekly saving", "Potential monthly saving", "Run date/time"],
-            "Value": [total_checked, matched, warnings, queries, ignored, f"{match_pct}%", f"£{weekly_saving:,.2f}", f"£{weekly_saving*4.33:,.2f}", datetime.now().strftime("%d/%m/%Y %H:%M")]
+            "Metric": ["Total chargeable lines checked", "Matched lines", "Warnings", "Queries", "Ignored £0 lines", "Match percentage", "Run date/time"],
+            "Value": [total_checked, matched, warnings, queries, ignored, f"{match_pct}%", datetime.now().strftime("%d/%m/%Y %H:%M")]
         })
         excel_bytes = make_excel(results_df, ignored_df, summary_df)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
         st.session_state["vendor_checker_results"] = {
             "results_df": results_df, "ignored_df": ignored_df, "summary_df": summary_df, "excel_bytes": excel_bytes,
             "total": total_checked, "matched": matched, "warnings": warnings, "queries": queries, "ignored": ignored,
-            "match_pct": match_pct, "weekly_saving": weekly_saving, "filename": f"PAS_Vendor_Hire_Report_Checked_{stamp}.xlsx"
+            "match_pct": match_pct, "filename": f"PAS_Vendor_On_Hire_Checked_{stamp}.xlsx"
         }
     except Exception as e:
         st.error(f"Something went wrong: {e}")
@@ -513,7 +534,7 @@ if res:
     header = "".join(f"<th>{escape(c)}</th>" for c in preview_cols[:-1])
     st.markdown('<div class="pas-pill">Vendor Report Checked</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="pas-table-wrap"><table class="pas-table"><thead><tr>{header}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>', unsafe_allow_html=True)
-    st.caption(f"Ignored £0 lines: {res['ignored']} | Potential weekly saving from off-hired items: £{res['weekly_saving']:,.2f}")
+    st.caption(f"Ignored £0 lines: {res['ignored']} | Price is ignored apart from £0 lines, which are excluded.")
     dl_left, dl_mid, dl_right = st.columns([1.3, 1, 1.3])
     with dl_mid:
         st.download_button("⬇  Download checked Excel", data=res["excel_bytes"], file_name=res["filename"], mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
