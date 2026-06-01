@@ -1,111 +1,273 @@
 import io
 import re
-from datetime import datetime
+import zipfile
+import tempfile
+from copy import copy
+from datetime import datetime, date
+from pathlib import Path
 from html import escape
-from difflib import SequenceMatcher
-from typing import Optional, List, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Side, PatternFill, Font
+from openpyxl.utils import get_column_letter
 
 try:
-    from rapidfuzz import fuzz
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 except Exception:
-    fuzz = None
-
-try:
-    from pypdf import PdfReader
-except Exception:
-    try:
-        from PyPDF2 import PdfReader
-    except Exception:
-        PdfReader = None
-
-try:
-    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-except Exception:
-    PatternFill = Font = Alignment = Border = Side = get_column_letter = None
+    colors = None
 
 PAS_YELLOW = "#FFD400"
 PAS_BLACK = "#0A0A0A"
-GREEN = "#C6EFCE"
-RED = "#FFC7CE"
-ORANGE = "#FCE4D6"
-GREY = "#E7E6E6"
+PAS_DARK = "#171717"
+PAS_GREY = "#F4F4F4"
+APP_VERSION = "v1.0 Prototype Build"
+TEMPLATE_PATHS = [
+    Path("assets/Hire Report Template.xlsx"),
+    Path("Hire Report Template.xlsx"),
+]
 
-st.set_page_config(page_title="PAS Vendor Hire Report Checker", page_icon="pas_logo.png", layout="wide")
+st.set_page_config(page_title="PAS Vendor On-Hire Checker", page_icon="pas_logo.png", layout="wide")
 
-st.markdown(f"""
-<style>
-.stApp {{ background:#f7f8fa; color:#0A0A0A; font-family:Inter, "Segoe UI", Arial, sans-serif; }}
-.block-container {{ max-width:1580px; padding:1.05rem 2rem 2rem 2rem; }}
-section[data-testid="stSidebar"] {{ background:linear-gradient(180deg,#050606 0%,#0b1015 100%); border-right:1px solid #161b22; }}
-section[data-testid="stSidebar"] * {{ color:white !important; }}
-section[data-testid="stSidebar"] img {{ border-radius:14px; box-shadow:0 10px 24px rgba(0,0,0,.26); }}
-.pas-sidebar-title {{ color:#fff; font-size:18px; font-weight:950; line-height:1.15; text-align:center; margin:20px 0 8px; }}
-.pas-yellow-line {{ width:72px; height:4px; background:{PAS_YELLOW}; border-radius:99px; margin:0 auto 22px; }}
-.pas-sidebar-copy {{ color:#fff; font-size:14px; line-height:1.52; font-weight:650; margin-bottom:24px; }}
-.pas-sidebar-rule {{ border-top:1px solid rgba(255,255,255,.22); margin:22px 0; }}
-.pas-sidebar-heading {{ color:{PAS_YELLOW} !important; font-size:19px; font-weight:950; margin:0 0 16px; }}
-.pas-nav-row {{ display:grid; grid-template-columns:26px 1fr; gap:10px; align-items:start; margin:15px 0; color:#fff; font-weight:750; line-height:1.25; font-size:14px; }}
-.pas-nav-icon svg {{ width:21px; height:21px; stroke:{PAS_YELLOW}; stroke-width:2.4; fill:none; stroke-linecap:round; stroke-linejoin:round; }}
-.pas-sidebar-footer {{ color:#fff; font-size:12px; font-weight:800; margin-top:28px; }}
-.pas-hero {{ display:flex; align-items:center; gap:16px; background:linear-gradient(100deg,#08090b 0%,#151718 70%,#c9aa00 130%); border-radius:16px; padding:12px 22px; margin:0 0 18px 0; box-shadow:0 9px 25px rgba(0,0,0,.13); min-height:60px; }}
-.pas-hero-logo {{ width:37px; height:37px; border-radius:7px; background:{PAS_YELLOW}; color:#000; display:inline-flex; align-items:center; justify-content:center; font-weight:950; font-size:14px; letter-spacing:-1px; }}
-.pas-hero-text {{ color:#fff; font-size:18px; font-weight:950; letter-spacing:-.02em; }}
-.pas-hero-dot {{ color:#fff; opacity:.8; margin:0 7px; }}
-.pas-hero-version {{ color:{PAS_YELLOW}; font-weight:950; }}
-.pas-upload-card {{ background:#fff; border:1px solid #e5e7eb; border-radius:18px; box-shadow:0 5px 18px rgba(15,23,42,.08); padding:16px 18px 14px; margin-bottom:14px; }}
-.pas-upload-title {{ color:#0A0A0A; font-size:16px; font-weight:950; margin-bottom:10px; }}
-div[data-testid="stFileUploader"] label {{ display:none !important; }}
-div[data-testid="stFileUploaderDropzoneInstructions"] {{ display:none !important; }}
-div[data-testid="stFileUploader"] section {{ background:transparent !important; border:0 !important; min-height:0 !important; padding:0 !important; }}
-div[data-testid="stFileUploader"] button {{ background:#fff !important; color:#0A0A0A !important; border:1px solid #d7dce3 !important; border-radius:10px !important; font-weight:900 !important; min-height:44px !important; box-shadow:0 2px 8px rgba(0,0,0,.06) !important; }}
-div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] {{ display:none !important; }}
-.pas-file-card {{ display:flex; align-items:center; gap:14px; background:#f4f6f8; border:1px solid #dfe4ea; border-radius:12px; padding:11px 14px; min-height:54px; margin:4px 0 12px; }}
-.pas-file-icon {{ width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:950; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.12); flex:none; }}
-.pas-file-icon.excel {{ background:#118a3b; }} .pas-file-icon.pdf {{ background:#df1f2d; }}
-.pas-file-main {{ flex:1; min-width:0; }} .pas-file-name {{ color:#0A0A0A; font-weight:950; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }} .pas-file-size {{ color:#4b5563; font-weight:650; font-size:13px; margin-top:2px; }} .pas-file-check {{ width:24px; height:24px; border-radius:50%; background:#108a37; color:white; display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:950; flex:none; }}
-.stButton > button, .stDownloadButton > button {{ background:{PAS_YELLOW} !important; color:{PAS_BLACK} !important; border:1px solid {PAS_BLACK} !important; border-radius:12px !important; font-weight:900 !important; min-height:52px !important; font-size:16px !important; box-shadow:0 6px 18px rgba(255,212,0,.25) !important; }}
-.stDownloadButton > button {{ min-height:62px !important; font-size:20px !important; }}
-.kpi-card {{ background:#fff; border-radius:18px; border:1px solid #e4e7eb; box-shadow:0 5px 20px rgba(15,23,42,.08); min-height:118px; padding:18px 22px; display:flex; align-items:center; gap:18px; }}
-.kpi-icon {{ width:64px; height:64px; border-radius:50%; background:#fff5bd; display:flex; align-items:center; justify-content:center; flex:none; }}
-.kpi-icon svg {{ width:35px; height:35px; stroke:#0A0A0A; stroke-width:2.5; fill:none; stroke-linecap:round; stroke-linejoin:round; }}
-.kpi-label {{ color:#111; font-size:15px; font-weight:950; margin:0 0 3px; }}
-.kpi-value {{ color:#e9b900; font-size:42px; line-height:.98; font-weight:950; }}
-.kpi-sub {{ color:#374151; font-size:14px; margin-top:6px; }}
-.kpi-red .kpi-value {{ color:#e12626; }} .kpi-green .kpi-value {{ color:#16a34a; }} .kpi-orange .kpi-value {{ color:#f59e0b; }}
-.pas-results-title {{ color:#0A0A0A; font-size:28px; font-weight:950; margin:22px 0 8px; }}
-.pas-pill {{ display:inline-flex; background:{PAS_YELLOW}; color:#0A0A0A; border-radius:14px 14px 0 0; padding:13px 20px; font-size:18px; font-weight:950; box-shadow:0 4px 14px rgba(0,0,0,.09); }}
-.pas-table-wrap {{ background:#fff; border:1px solid #e0e4e9; border-radius:0 16px 16px 16px; max-height:430px; overflow:auto; box-shadow:0 7px 25px rgba(15,23,42,.10); }}
-table.pas-table {{ width:100%; border-collapse:collapse; font-size:14px; color:#0A0A0A; }}
-table.pas-table thead th {{ background:{PAS_YELLOW}; color:#0A0A0A; border:1px solid #e2ba00; padding:12px 14px; font-weight:950; text-align:left; white-space:nowrap; position:sticky; top:0; z-index:5; }}
-table.pas-table tbody td {{ background:#fff; color:#0A0A0A; border:1px solid #e1e5eb; padding:10px 14px; vertical-align:top; }}
-table.pas-table tbody tr.green td {{ background:{GREEN}; }} table.pas-table tbody tr.red td {{ background:{RED}; }} table.pas-table tbody tr.orange td {{ background:{ORANGE}; }}
-div[data-testid="stAlert"], div[data-testid="stAlert"] * {{ color:#0A0A0A !important; }}
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    f"""
+    <style>
+    .stApp {{ background: #f5f5f5; color: #0A0A0A; }}
+    section[data-testid="stSidebar"] {{
+        background: {PAS_BLACK};
+        color: white;
+        padding-top: 1.45rem;
+    }}
+    section[data-testid="stSidebar"] * {{ color: white; }}
+    section[data-testid="stSidebar"] img {{
+        margin-top: 0.15rem;
+        border-radius: 14px;
+    }}
+    .block-container {{
+        padding-top: 1.4rem;
+        padding-bottom: 2rem;
+        max-width: 1500px;
+    }}
 
-with st.sidebar:
-    st.image("pas_logo.png", use_column_width=True)
-    st.markdown("""
-    <div class="pas-sidebar-title">PAS Vendor<br>On-Hire Checker</div>
-    <div class="pas-yellow-line"></div>
-    <div class="pas-sidebar-copy">Upload a vendor hire report and the PAS Material & Plant Orders spreadsheet, then check whether each chargeable item is still live on hire.</div>
-    <div class="pas-sidebar-rule"></div>
-    <div class="pas-sidebar-heading">Instructions</div>
-    <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 16l-4-4-4 4"/><path d="M12 12v9"/><path d="M20 16.6A5 5 0 0 0 18 7h-1.3A8 8 0 1 0 4 15.3"/></svg></span><span>Upload Vendor Hire Report</span></div>
-    <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6"/><path d="M9 17h6"/></svg></span><span>Upload Materials & Plant Report</span></div>
-    <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3l14 9-14 9V3z"/></svg></span><span>Run Reconciliation</span></div>
-    <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg></span><span>Download Checked Excel</span></div>
-    <div class="pas-sidebar-rule"></div>
-    <div class="pas-sidebar-footer">PAS NW Ltd • v1.0 Prototype Build</div>
-    """, unsafe_allow_html=True)
+    .pas-hero {{
+        background: linear-gradient(135deg, {PAS_BLACK} 0%, #202020 70%, #7a6900 135%);
+        border-radius: 18px;
+        padding: 24px 28px;
+        margin-bottom: 18px;
+        box-shadow: 0 8px 25px rgba(0,0,0,0.12);
+    }}
+    .pas-title {{
+        color: white;
+        font-size: 32px;
+        font-weight: 900;
+        margin: 0;
+        letter-spacing: -0.03em;
+    }}
+    .pas-subtitle {{
+        color: {PAS_YELLOW};
+        font-size: 14px;
+        margin-top: 4px;
+        font-weight: 800;
+    }}
 
-st.markdown("""
-<div class="pas-hero"><div class="pas-hero-logo">PAS</div><div class="pas-hero-text">PAS Vendor On-Hire Checker<span class="pas-hero-dot">•</span><span class="pas-hero-version">v1.0 Prototype Build</span></div></div>
-""", unsafe_allow_html=True)
+    .kpi-card {{
+        background: white;
+        border-radius: 18px;
+        padding: 18px 20px;
+        border: 1px solid #e8e8e8;
+        box-shadow: 0 3px 12px rgba(0,0,0,0.05);
+        min-height: 112px;
+    }}
+    .kpi-label {{
+        color: #111;
+        font-size: 14px;
+        font-weight: 800;
+        margin-bottom: 8px;
+    }}
+    .kpi-value {{
+        color: {PAS_YELLOW};
+        font-size: 36px;
+        font-weight: 950;
+        line-height: 1.05;
+        text-shadow: 0 1px 0 #111;
+    }}
+    .kpi-sub {{
+        color: #222;
+        font-size: 13px;
+        margin-top: 6px;
+    }}
+
+    .stButton > button, .stDownloadButton > button {{
+        background: {PAS_YELLOW} !important;
+        color: {PAS_BLACK} !important;
+        border: 1px solid {PAS_BLACK} !important;
+        border-radius: 12px !important;
+        font-weight: 900 !important;
+    }}
+
+    .stCaption, div[data-testid="stCaptionContainer"], .stMarkdown p, .stInfo {{
+        color: #0A0A0A !important;
+    }}
+
+    .pas-results-title {{
+        color: #0A0A0A;
+        font-size: 26px;
+        font-weight: 950;
+        margin: 22px 0 8px 0;
+    }}
+    .pas-unmatched-pill {{
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: {PAS_YELLOW};
+        color: {PAS_BLACK};
+        border: 1px solid #111;
+        border-radius: 14px 14px 0 0;
+        padding: 11px 18px;
+        font-weight: 950;
+        box-shadow: 0 3px 10px rgba(0,0,0,0.08);
+        margin-top: 4px;
+    }}
+
+    .pas-table-wrap {{
+        background: white;
+        border: 1px solid #d9d9d9;
+        border-radius: 0 16px 16px 16px;
+        overflow: auto;
+        box-shadow: 0 4px 18px rgba(0,0,0,0.07);
+        margin-bottom: 18px;
+    }}
+    table.pas-table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+        color: #0A0A0A;
+        background: white;
+    }}
+    table.pas-table thead th {{
+        background: {PAS_YELLOW};
+        color: {PAS_BLACK};
+        font-weight: 950;
+        text-align: left;
+        padding: 11px 12px;
+        border: 1px solid #c7a900;
+        white-space: nowrap;
+    }}
+    table.pas-table tbody td {{
+        background: white;
+        color: #0A0A0A;
+        padding: 9px 12px;
+        border: 1px solid #e3e3e3;
+        vertical-align: top;
+    }}
+    table.pas-table tbody tr:nth-child(even) td {{ background: #fbfbfb; }}
+    table.pas-table a {{ color: #006fd6 !important; font-weight: 800; text-decoration: none; }}
+    .pas-note {{ color: #0A0A0A; font-size: 13px; margin: 8px 0 16px 0; }}
+    .pas-support {{ color: #0A0A0A; font-size: 14px; margin: 16px 0; }}
+
+    div[data-testid="stAlert"], div[data-testid="stAlert"] * {{ color: #0A0A0A !important; }}
+    div[data-testid="stAlert"] {{ border: 1px solid #e2ba00 !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"""
+    <style>
+    section[data-testid="stSidebar"] .stMarkdown p,
+    section[data-testid="stSidebar"] .stMarkdown li,
+    section[data-testid="stSidebar"] .stMarkdown h1,
+    section[data-testid="stSidebar"] .stMarkdown h2,
+    section[data-testid="stSidebar"] .stMarkdown h3,
+    section[data-testid="stSidebar"] .stMarkdown strong,
+    section[data-testid="stSidebar"] .stMarkdown span {{ color: #ffffff !important; }}
+
+    div[data-testid="stFileUploader"] svg,
+    div[data-testid="stFileUploader"] button svg,
+    div[data-testid="stFileUploader"] [data-testid="stIconMaterial"] {{
+        color: #FFD400 !important;
+        fill: #FFD400 !important;
+        stroke: #FFD400 !important;
+    }}
+    div[data-testid="stFileUploader"] section {{
+        background: #24242d !important;
+        border: 1px solid #30303a !important;
+        border-radius: 12px !important;
+    }}
+    div[data-testid="stFileUploader"] button {{
+        color: white !important;
+        border-color: #454552 !important;
+        background: #111217 !important;
+    }}
+    .pas-table-wrap {{ max-height: 510px !important; overflow-y: auto !important; overflow-x: auto !important; }}
+    .pas-table-wrap thead th {{ position: sticky; top: 0; z-index: 2; }}
+    .pas-note, .pas-support, .pas-support * {{ color: #0A0A0A !important; }}
+    .pas-sidebar-title {{ color:#fff; font-size:18px; font-weight:950; line-height:1.15; text-align:center; margin: 20px 0 8px; }}
+    .pas-yellow-line {{ width:72px; height:4px; background:{PAS_YELLOW}; border-radius:99px; margin: 0 auto 22px; }}
+    .pas-sidebar-copy {{ color:#fff !important; font-size:14px; line-height:1.52; font-weight:650; margin-bottom:24px; }}
+    .pas-sidebar-rule {{ border-top:1px solid rgba(255,255,255,.22); margin:22px 0; }}
+    .pas-sidebar-heading {{ color:{PAS_YELLOW}; font-size:19px; font-weight:950; margin: 0 0 16px; }}
+    .pas-nav-row {{ display:grid; grid-template-columns: 26px 1fr; gap:10px; align-items:start; margin: 15px 0; color:#fff; font-weight:750; line-height:1.25; font-size:14px; }}
+    .pas-nav-icon svg {{ width:21px; height:21px; stroke:{PAS_YELLOW}; stroke-width:2.4; fill:none; stroke-linecap:round; stroke-linejoin:round; }}
+    .pas-sidebar-footer {{ color:#fff; font-size:12px; font-weight:800; margin-top:28px; }}
+
+    .pas-hero {{ display:flex; align-items:center; gap:16px; background: linear-gradient(100deg, #08090b 0%, #151718 70%, #c9aa00 130%) !important; border-radius: 16px !important; padding: 12px 22px !important; margin: 0 0 18px 0 !important; box-shadow: 0 9px 25px rgba(0,0,0,.13) !important; min-height:60px; }}
+    .pas-hero-logo {{ width:37px; height:37px; border-radius:7px; background:{PAS_YELLOW}; color:#000; display:inline-flex; align-items:center; justify-content:center; font-weight:950; font-size:14px; letter-spacing:-1px; }}
+    .pas-hero-text {{ color:#fff; font-size:18px; font-weight:950; letter-spacing:-.02em; }}
+    .pas-hero-dot {{ color:#fff; opacity:.8; margin: 0 7px; }}
+    .pas-hero-version {{ color:{PAS_YELLOW}; font-weight:950; }}
+
+    .pas-upload-card {{ background:#fff; border:1px solid #e5e7eb; border-radius:18px; box-shadow:0 5px 18px rgba(15,23,42,.08); padding:16px 18px 14px; margin-bottom:14px; }}
+    .pas-upload-title {{ color:#0A0A0A; font-size:16px; font-weight:950; margin-bottom:10px; }}
+    div[data-testid="stFileUploader"] {{ margin:0 !important; }}
+    div[data-testid="stFileUploader"] label {{ display:none !important; }}
+    div[data-testid="stFileUploader"] section {{ background:#f4f6f8 !important; border:1px solid #dfe4ea !important; border-radius:11px !important; min-height:52px !important; padding:8px 10px !important; }}
+    div[data-testid="stFileUploader"] section * {{ color:#0A0A0A !important; }}
+    div[data-testid="stFileUploader"] button {{ background:#fff !important; color:#0A0A0A !important; border:1px solid #d7dce3 !important; border-radius:10px !important; font-weight:900 !important; box-shadow:0 2px 8px rgba(0,0,0,.06) !important; }}
+    div[data-testid="stFileUploader"] svg {{ color:#0A0A0A !important; fill:currentColor !important; stroke:currentColor !important; }}
+    div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] {{ background:#fff !important; border:1px solid #dfe4ea !important; border-radius:10px !important; color:#0A0A0A !important; }}
+    div[data-testid="stFileUploader"] small {{ color:#4b5563 !important; }}
+    div.stButton > button[kind="secondary"], .stButton > button {{ min-height:52px !important; font-size:16px !important; box-shadow:0 6px 18px rgba(255,212,0,.25) !important; }}
+    .stDownloadButton > button {{ min-height:62px !important; font-size:20px !important; box-shadow:0 6px 18px rgba(255,212,0,.25) !important; }}
+
+    .kpi-card {{ background:#fff !important; border-radius:18px !important; border:1px solid #e4e7eb !important; box-shadow:0 5px 20px rgba(15,23,42,.08) !important; min-height:118px !important; padding:18px 22px !important; display:flex; align-items:center; gap:18px; }}
+    .kpi-icon {{ width:64px; height:64px; border-radius:50%; background:#fff5bd; display:flex; align-items:center; justify-content:center; flex:none; }}
+    .kpi-icon svg {{ width:35px; height:35px; stroke:#0A0A0A; stroke-width:2.5; fill:none; stroke-linecap:round; stroke-linejoin:round; }}
+    .kpi-label {{ color:#111 !important; font-size:15px !important; font-weight:950 !important; margin:0 0 3px !important; }}
+    .kpi-value {{ color:#e9b900 !important; font-size:42px !important; line-height:.98 !important; font-weight:950 !important; text-shadow:none !important; }}
+    .kpi-sub {{ color:#374151 !important; font-size:14px !important; margin-top:6px !important; }}
+
+    .pas-results-title {{ color:#0A0A0A !important; font-size:28px !important; font-weight:950 !important; margin: 22px 0 8px !important; }}
+    .pas-unmatched-pill {{ background:{PAS_YELLOW} !important; color:#0A0A0A !important; border:0 !important; border-radius:14px 14px 0 0 !important; padding:13px 20px !important; font-size:18px; box-shadow:0 4px 14px rgba(0,0,0,.09); }}
+    .pas-table-wrap {{ background:#fff !important; border:1px solid #e0e4e9 !important; border-radius:0 16px 16px 16px !important; max-height:430px !important; overflow:auto !important; box-shadow:0 7px 25px rgba(15,23,42,.10) !important; }}
+    table.pas-table {{ font-size:14px !important; color:#0A0A0A !important; }}
+    table.pas-table thead th {{ background:{PAS_YELLOW} !important; color:#0A0A0A !important; border:1px solid #e2ba00 !important; padding:12px 14px !important; font-weight:950 !important; position:sticky; top:0; z-index:5; }}
+    table.pas-table tbody td {{ background:#fff !important; color:#0A0A0A !important; border:1px solid #e1e5eb !important; padding:10px 14px !important; }}
+    table.pas-table tbody tr:nth-child(even) td {{ background:#fbfcfd !important; }}
+
+    div[data-testid="stFileUploader"] [data-testid="stFileUploaderFile"] {{ display: none !important; }}
+    div[data-testid="stFileUploaderDropzone"] {{ background: transparent !important; border: 0 !important; padding: 0 !important; min-height: 0 !important; }}
+    div[data-testid="stFileUploaderDropzoneInstructions"] {{ display: none !important; }}
+    div[data-testid="stFileUploader"] section {{ background: transparent !important; border: 0 !important; min-height: 0 !important; padding: 0 !important; }}
+    .pas-file-card {{ display:flex; align-items:center; gap:14px; background:#f4f6f8; border:1px solid #dfe4ea; border-radius:12px; padding:11px 14px; min-height:54px; margin: 4px 0 12px; }}
+    .pas-file-icon {{ width:32px; height:32px; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:950; font-size:11px; box-shadow:0 2px 8px rgba(0,0,0,.12); flex:none; }}
+    .pas-file-icon.excel {{ background:#118a3b; }}
+    .pas-file-main {{ flex:1; min-width:0; }}
+    .pas-file-name {{ color:#0A0A0A; font-weight:950; font-size:15px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .pas-file-size {{ color:#4b5563; font-weight:650; font-size:13px; margin-top:2px; }}
+    .pas-file-check {{ width:24px; height:24px; border-radius:50%; background:#108a37; color:white; display:flex; align-items:center; justify-content:center; font-size:15px; font-weight:950; flex:none; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 
 st.markdown(
     """
@@ -215,102 +377,218 @@ def render_bottom_chase():
     )
 
 
-# ---------- helpers ----------
-def clean_cell(value) -> str:
-    if value is None or pd.isna(value): return ""
-    text = str(value).strip()
-    return "" if text.lower() in {"nan", "none", "nat"} else text
+def logo_available() -> bool:
+    return Path("pas_logo.png").exists() or Path("assets/pas_logo.png").exists()
 
-def normalise_text(text: str) -> str:
-    text = clean_cell(text).lower()
-    repl = {
-        "tonne":"t", "ton":"t", "tons":"t", "3 ton":"3t", "3 tonne":"3t", "1 ton":"1t", "1 tonne":"1t",
-        "mini digger":"excavator", "digger":"excavator", "cutquick":"stihl saw", "disc cutter":"stihl saw",
-        "cabins":"cabin", "site unit":"cabin", "welfare unit":"welfare", "telehandler":"telehandler",
-        "fork lift":"forklift", "fork-lift":"forklift", "genie":"lift", "generator":"genny"
-    }
-    for k, v in repl.items(): text = text.replace(k, v)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    stop = {"the","and","with","c/w","cw","hire","plant","ltd","limited","weekly","week","per","for","to","of","x"}
-    words = [w for w in text.split() if w not in stop]
-    return " ".join(words)
+with st.sidebar:
+    if Path("pas_logo.png").exists():
+        st.image("pas_logo.png", use_column_width=True)
+    elif Path("assets/pas_logo.png").exists():
+        st.image("assets/pas_logo.png", use_column_width=True)
+    else:
+        st.markdown('<div style="background:#FFD400;color:#000;border-radius:14px;padding:18px;text-align:center;font-weight:950;font-size:30px;">PAS</div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="pas-sidebar-title">PAS Vendor<br>On-Hire Checker</div>
+        <div class="pas-yellow-line"></div>
+        <div class="pas-sidebar-copy">Upload vendor hire report and Materials & Plant Orders, then export matched/unmatched Excel.</div>
+        <div class="pas-sidebar-rule"></div>
+        <div class="pas-sidebar-heading">Instructions</div>
+        <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M16 16l-4-4-4 4"/><path d="M12 12v9"/><path d="M20 16.6A5 5 0 0 0 18 7h-1.3A8 8 0 1 0 4 15.3"/></svg></span><span>Upload Vendor Hire Report</span></div>
+        <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M5 3l14 9-14 9V3z"/></svg></span><span>Run On-Hire Check</span></div>
+        <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg></span><span>Download Excel</span></div>
+        <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg></span><span>Matched / Unmatched Only</span></div>
+        <div class="pas-nav-row"><span class="pas-nav-icon"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg></span><span>Smoke Crack</span></div>
+        <div class="pas-sidebar-rule"></div>
+        <div class="pas-sidebar-footer">PAS NW Ltd • v1.0 Prototype Build</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-def money_to_float(value) -> Optional[float]:
-    if value is None or pd.isna(value): return None
-    if isinstance(value, (int, float)): return round(float(value), 2)
-    text = str(value).replace(",", "")
-    m = re.findall(r"-?£?\s*([0-9]+(?:\.[0-9]+)?)", text)
-    if not m: return None
-    try: return round(float(m[-1]), 2)
-    except Exception: return None
+st.markdown(
+    f"""
+    <div class="pas-hero">
+      <div class="pas-hero-logo">PAS</div>
+      <div class="pas-hero-text">PAS NW Ltd<span class="pas-hero-dot">•</span><span class="pas-hero-version">{APP_VERSION}</span></div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-def normalise_po(value) -> str:
-    text = clean_cell(value).upper()
-    # Vendor order often looks like P114/H4767. PAS has Job No P114 and Order Number H4767.
-    parts = re.findall(r"[A-Z]+\d+[A-Z0-9&]*", text)
-    return " ".join(parts) if parts else re.sub(r"[^A-Z0-9]+", " ", text).strip()
-
-def extract_job(value) -> str:
-    text = clean_cell(value).upper()
-    m = re.search(r"\bP\d+[A-Z0-9&]*\b", text)
-    return m.group(0) if m else ""
-
-def extract_hire_no(value) -> str:
-    text = clean_cell(value).upper()
-    m = re.search(r"\bH\d+\b", text)
-    return m.group(0) if m else ""
-
-def job_base(job: str) -> str:
-    m = re.match(r"^(P\d+)", clean_cell(job).upper())
-    return m.group(1) if m else clean_cell(job).upper()
-
-def find_col(columns: List[str], keywords: List[str]) -> Optional[str]:
-    norm = {c: re.sub(r"[^a-z0-9]+", "", str(c).lower()) for c in columns}
-    for key in keywords:
-        nkey = re.sub(r"[^a-z0-9]+", "", key.lower())
-        for col, ncol in norm.items():
-            if nkey == ncol: return col
-    for key in keywords:
-        nkey = re.sub(r"[^a-z0-9]+", "", key.lower())
-        for col, ncol in norm.items():
-            if nkey in ncol or ncol in nkey: return col
-    return None
-
-def similarity(a: str, b: str) -> float:
-    a2, b2 = normalise_text(a), normalise_text(b)
-    if not a2 or not b2: return 0.0
-    if fuzz:
-        return max(fuzz.token_set_ratio(a2, b2), fuzz.partial_ratio(a2, b2)) / 100
-    return SequenceMatcher(None, a2, b2).ratio()
-
-def format_date(value):
-    if value is None or pd.isna(value): return ""
-    try:
-        d = pd.to_datetime(value, dayfirst=True, errors="coerce")
-        if pd.isna(d): return clean_cell(value)
-        return d.strftime("%d/%m/%Y")
-    except Exception:
-        return clean_cell(value)
 
 def render_selected_file_card(uploaded_file, file_kind="excel"):
     size = getattr(uploaded_file, "size", 0) or 0
-    size_text = f"{size/(1024*1024):.1f} MB" if size >= 1024*1024 else f"{size/1024:.0f} KB"
-    icon = "PDF" if file_kind == "pdf" else "XLS"
-    icon_class = "pdf" if file_kind == "pdf" else "excel"
-    st.markdown(f'''<div class="pas-file-card"><div class="pas-file-icon {icon_class}">{icon}</div><div class="pas-file-main"><div class="pas-file-name">{escape(getattr(uploaded_file,'name','Uploaded file'))}</div><div class="pas-file-size">{size_text}</div></div><div class="pas-file-check">✓</div></div>''', unsafe_allow_html=True)
+    if size >= 1024 * 1024:
+        size_text = f"{size / (1024 * 1024):.1f} MB"
+    else:
+        size_text = f"{size / 1024:.0f} KB"
+    st.markdown(
+        f'''
+        <div class="pas-file-card">
+            <div class="pas-file-icon excel">XLS</div>
+            <div class="pas-file-main">
+                <div class="pas-file-name">{escape(getattr(uploaded_file, "name", "Uploaded file"))}</div>
+                <div class="pas-file-size">{size_text}</div>
+            </div>
+            <div class="pas-file-check">✓</div>
+        </div>
+        ''',
+        unsafe_allow_html=True,
+    )
 
-# ---------- file loading ----------
+
+
+# ===== Vendor On-Hire Checker logic =====
+from difflib import SequenceMatcher
+from typing import Optional, List, Tuple, Dict
+
+GREEN_FILL = "C6EFCE"
+RED_FILL = "FFC7CE"
+ORANGE_FILL = "F4B183"
+HEADER_FILL = "FFD400"
+WHITE_FILL = "FFFFFF"
+
+
+def clean_cell(value) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "nat"}:
+        return ""
+    return text
+
+
+def norm_header(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_cell(value).lower())
+
+
+def find_col(columns: List[str], aliases: List[str]) -> Optional[str]:
+    normed = {c: norm_header(c) for c in columns}
+    alias_norms = [norm_header(a) for a in aliases]
+    for alias in alias_norms:
+        for col, ncol in normed.items():
+            if alias == ncol:
+                return col
+    for alias in alias_norms:
+        for col, ncol in normed.items():
+            if alias and alias in ncol:
+                return col
+    return None
+
+
+def money_to_float(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+    text = clean_cell(value).replace(",", "")
+    if not text:
+        return None
+    matches = re.findall(r"-?£?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if not matches:
+        return None
+    try:
+        return round(float(matches[-1]), 2)
+    except Exception:
+        return None
+
+
+def normalise_text(value) -> str:
+    text = clean_cell(value).lower()
+    replacements = {
+        "3 tonne": "3t", "3 ton": "3t", "3-ton": "3t", "3 tonne": "3t",
+        "1 tonne": "1t", "1 ton": "1t", "1-ton": "1t",
+        "5 tonne": "5t", "5 ton": "5t", "5-ton": "5t",
+        "digger": "excavator", "mini digger": "excavator", "exc": "excavator",
+        "wacker plate": "plate compactor", "vib plate": "plate compactor", "vibrating plate": "plate compactor",
+        "stihl saw": "cut off saw", "stihl": "cut off saw", "disc cutter": "cut off saw",
+        "telehandler": "telehandler", "fork lift": "forklift", "fork-lift": "forklift",
+        "welfare cabin": "welfare unit", "site cabin": "welfare unit", "cabin": "welfare unit",
+        "gen set": "generator", "genny": "generator",
+        "qty": "quantity",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    stop = {
+        "the", "and", "with", "for", "hire", "weekly", "week", "charge", "item", "plant", "no",
+        "serial", "fleet", "make", "model", "pas", "nw", "ltd", "each", "day", "days", "wk"
+    }
+    tokens = [t for t in text.split() if t not in stop]
+    return " ".join(tokens)
+
+
+def similarity(a, b) -> float:
+    a2, b2 = normalise_text(a), normalise_text(b)
+    if not a2 or not b2:
+        return 0.0
+    set_a, set_b = set(a2.split()), set(b2.split())
+    if not set_a or not set_b:
+        return SequenceMatcher(None, a2, b2).ratio()
+    token_overlap = len(set_a & set_b) / max(1, min(len(set_a), len(set_b)))
+    seq = SequenceMatcher(None, a2, b2).ratio()
+    contained = 1.0 if a2 in b2 or b2 in a2 else 0.0
+    return max(seq, token_overlap, contained)
+
+
+def extract_job(value) -> str:
+    text = clean_cell(value).upper()
+    m = re.search(r"\b(P\d{2,4})(?:[A-Z0-9&/-]*)?\b", text)
+    return m.group(1) if m else ""
+
+
+def extract_hire_no(value) -> str:
+    text = clean_cell(value)
+    m = re.search(r"\b(\d{4,8})\b", text)
+    return m.group(1) if m else ""
+
+
+def normalise_fleet(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_cell(value).lower())
+
+
+def is_live_status(status: str) -> bool:
+    s = clean_cell(status).lower().strip()
+    return s in {"on hire", "missing"}
+
+
+def is_off_hired_status(status: str) -> bool:
+    s = clean_cell(status).lower().strip()
+    return "off" in s and "hire" in s
+
+
+def is_operated_plant_text(*values) -> bool:
+    blob = " ".join(clean_cell(v).lower() for v in values)
+    return "operated plant" in blob or "operated" in blob and "plant" in blob
+
+
 def read_excel_any(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".xls"):
         return pd.read_excel(uploaded_file, engine="xlrd")
     return pd.read_excel(uploaded_file)
 
+
 def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     name = uploaded_file.name.lower()
     if name.endswith(".pdf"):
-        if PdfReader is None:
-            raise RuntimeError("PDF reader unavailable. Add pypdf to requirements.txt.")
+        try:
+            from pypdf import PdfReader
+        except Exception:
+            try:
+                from PyPDF2 import PdfReader
+            except Exception:
+                raise RuntimeError("PDF reader unavailable. Add pypdf to requirements.txt.")
         pdf_bytes = uploaded_file.read(); uploaded_file.seek(0)
         reader = PdfReader(io.BytesIO(pdf_bytes))
         rows = []
@@ -318,10 +596,10 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
             text = page.extract_text() or ""
             for line in text.splitlines():
                 line = re.sub(r"\s+", " ", line).strip()
-                if not line: continue
+                if not line:
+                    continue
                 rate = money_to_float(line)
-                if rate is None: continue
-                rows.append({"Description": line, "Hire Rate": rate, "Source Page": page_no})
+                rows.append({"Description": line, "Rate": rate, "Source Page": page_no})
         raw = pd.DataFrame(rows)
     else:
         raw = read_excel_any(uploaded_file)
@@ -329,387 +607,334 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cols = list(raw.columns)
     mapping = {
         "Vendor Site": find_col(cols, ["Site", "Location", "Project", "Job", "Site Name"]),
-        "Vendor Fleet No": find_col(cols, ["Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No"]),
-        "Vendor Description": find_col(cols, ["Description", "Item Description", "Product", "Equipment", "Plant Description"]),
+        "Vendor Fleet No": find_col(cols, ["Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]),
+        "Vendor Description": find_col(cols, ["Description", "Item Description", "Product", "Equipment", "Plant Description", "Name"]),
         "Vendor Qty": find_col(cols, ["Quantity", "Qty"]),
         "Vendor On Hire Date": find_col(cols, ["Date", "On Hire Date", "Start Date", "Delivery Date", "Hired Date"]),
         "Vendor Contract No": find_col(cols, ["Syrinx Contract No", "Contract No", "Contract", "Hire Contract"]),
         "Vendor Order No": find_col(cols, ["Order No", "PO", "Purchase Order", "Order Number", "Customer Order"]),
-        "Vendor Rate": find_col(cols, ["Hire Rate", "Rate", "Weekly Rate", "Cost", "Value", "Charge"]),
+        "Vendor Rate": find_col(cols, ["Hire Rate", "Rate", "Weekly Rate", "Cost", "Value", "Charge", "Amount"]),
     }
     out = pd.DataFrame()
     for new_col, old_col in mapping.items():
         out[new_col] = raw[old_col] if old_col in raw.columns else ""
-    out["Vendor Rate Value"] = out["Vendor Rate"].apply(money_to_float)
-    out["Vendor Job"] = out["Vendor Order No"].apply(extract_job)
-    out["Vendor Hire No"] = out["Vendor Order No"].apply(extract_hire_no)
-    out["Vendor Description Clean"] = out["Vendor Description"].apply(normalise_text)
+    if "Vendor Description" not in out or out["Vendor Description"].replace("", pd.NA).dropna().empty:
+        # fallback: first meaningful text column
+        for col in cols:
+            if raw[col].dtype == object:
+                out["Vendor Description"] = raw[col]
+                break
+    out["Vendor Rate Value"] = out.get("Vendor Rate", "").apply(money_to_float) if isinstance(out.get("Vendor Rate", ""), pd.Series) else None
+    out["Vendor Job"] = out.get("Vendor Order No", "").apply(extract_job) if isinstance(out.get("Vendor Order No", ""), pd.Series) else ""
+    out["Vendor Hire No"] = out.get("Vendor Order No", "").apply(extract_hire_no) if isinstance(out.get("Vendor Order No", ""), pd.Series) else ""
     out["Vendor Row No"] = range(2, len(out) + 2)
     return raw, out
+
 
 def load_pas_plant(uploaded_file) -> pd.DataFrame:
     xls = pd.ExcelFile(uploaded_file)
     sheet = "Plant" if "Plant" in xls.sheet_names else xls.sheet_names[0]
     df = pd.read_excel(xls, sheet_name=sheet).dropna(how="all").copy()
     cols = list(df.columns)
+    def pick(names):
+        col = find_col(cols, names)
+        return df[col] if col in df.columns else ""
     out = pd.DataFrame()
-    out["PAS Description"] = df[find_col(cols, ["Description", "Item Description"])] if find_col(cols, ["Description", "Item Description"]) else ""
-    out["PAS Fleet No"] = df[find_col(cols, ["Fleet No.", "Fleet No", "Fleet", "Item No"])] if find_col(cols, ["Fleet No.", "Fleet No", "Fleet", "Item No"]) else ""
-    out["PAS Supplier"] = df[find_col(cols, ["Supplier", "Vendor"])] if find_col(cols, ["Supplier", "Vendor"]) else ""
-    out["PAS Qty"] = df[find_col(cols, ["Qty", "Quantity"])] if find_col(cols, ["Qty", "Quantity"]) else ""
-    out["PAS Weekly Cost"] = df[find_col(cols, ["Cost", "Weekly Rate", "Hire Rate"])] if find_col(cols, ["Cost", "Weekly Rate", "Hire Rate"]) else ""
-    out["PAS Day Rate"] = df[find_col(cols, ["Day Rate", "Daily Rate"])] if find_col(cols, ["Day Rate", "Daily Rate"]) else ""
-    out["PAS On Hire Date"] = df[find_col(cols, ["On Hire / Delivery Date", "On Hire Date", "Delivery Date"])] if find_col(cols, ["On Hire / Delivery Date", "On Hire Date", "Delivery Date"]) else ""
-    out["PAS Expected Off Hire Date"] = df[find_col(cols, ["Expected Off-Hire Date", "Expected Off Hire Date"])] if find_col(cols, ["Expected Off-Hire Date", "Expected Off Hire Date"]) else ""
-    out["PAS Off Hire Date"] = df[find_col(cols, ["Off Hire Date", "Off-Hire Date"])] if find_col(cols, ["Off Hire Date", "Off-Hire Date"]) else ""
-    out["PAS Status"] = df[find_col(cols, ["Status"])] if find_col(cols, ["Status"]) else ""
-    out["PAS Job No"] = df[find_col(cols, ["Job No", "Job Number", "Job"])] if find_col(cols, ["Job No", "Job Number", "Job"]) else ""
-    out["PAS Order Number"] = df[find_col(cols, ["Order Number", "Sage Order No", "PO"])] if find_col(cols, ["Order Number", "Sage Order No", "PO"]) else ""
-    out["PAS Site Name"] = df[find_col(cols, ["Site Name", "Site"])] if find_col(cols, ["Site Name", "Site"]) else ""
-    out["PAS Description Clean"] = out["PAS Description"].apply(normalise_text)
-    out["PAS Job Base"] = out["PAS Job No"].apply(job_base)
+    out["PAS Description"] = pick(["Description", "Item Description", "Plant Description"])
+    out["PAS Fleet No"] = pick(["Fleet No.", "Fleet No", "Fleet", "Item No", "Serial"])
+    out["PAS Supplier"] = pick(["Supplier", "Vendor"])
+    out["PAS Qty"] = pick(["Qty", "Quantity"])
+    out["PAS On Hire Date"] = pick(["On Hire / Delivery Date", "On Hire Date", "Delivery Date"])
+    out["PAS Expected Off Hire Date"] = pick(["Expected Off-Hire Date", "Expected Off Hire Date"])
+    out["PAS Off Hire Date"] = pick(["Off Hire Date", "Off-Hire Date"])
+    out["PAS Status"] = pick(["Status"])
+    out["PAS Job No"] = pick(["Job No", "Job Number", "Job"])
+    out["PAS Order Number"] = pick(["Order Number", "Sage Order No", "PO", "Purchase Order"])
+    out["PAS Site Name"] = pick(["Site Name", "Site"])
     out["PAS Row No"] = range(2, len(out) + 2)
+    out["PAS Job Base"] = out["PAS Job No"].apply(extract_job)
     return out
 
-# ---------- matching ----------
-def pas_is_live(status: str) -> bool:
-    status_text = clean_cell(status).lower().strip()
-    return status_text in {"on hire", "missing"}
 
-def pas_is_off_hired(status: str) -> bool:
-    status_text = clean_cell(status).lower().strip()
-    return "off" in status_text and "hire" in status_text
+def vendor_zero_cost(vrow) -> bool:
+    val = vrow.get("Vendor Rate Value", None)
+    return val is not None and not pd.isna(val) and abs(float(val)) < 0.0001
+
 
 def score_candidate(vrow, prow) -> Tuple[float, List[str]]:
-    """Score likely PAS matches. Price is deliberately ignored.
-
-    The goal is only to decide whether the vendor line is still live on the
-    PAS Materials & Plant report. Fleet helps confidence, but a fleet mismatch
-    does not fail the line.
-    """
     reasons = []
-    score = 0.0
-
-    desc_score = similarity(vrow.get("Vendor Description", ""), prow.get("PAS Description", ""))
-    score += desc_score * 65
-    if desc_score >= 0.88:
-        reasons.append("Strong description match")
-    elif desc_score >= 0.72:
-        reasons.append("Possible description match")
-
-    vjob = job_base(vrow.get("Vendor Job", ""))
-    pjob = job_base(prow.get("PAS Job No", ""))
+    score = similarity(vrow.get("Vendor Description", ""), prow.get("PAS Description", "")) * 75
+    vjob = clean_cell(vrow.get("Vendor Job", ""))
+    pjob = clean_cell(prow.get("PAS Job Base", "")) or extract_job(prow.get("PAS Job No", ""))
     if vjob and pjob and vjob == pjob:
-        score += 22
-        reasons.append("Job matches")
-
-    # Vendor reports commonly show P114/H4767. The H number is the PAS order.
-    vhire = clean_cell(vrow.get("Vendor Hire No", "")).upper()
-    phire = clean_cell(prow.get("PAS Order Number", "")).upper()
-    if vhire and phire and vhire == phire:
-        score += 32
-        reasons.append("Order number matches")
-
-    vfleet = clean_cell(vrow.get("Vendor Fleet No", "")).upper()
-    pfleet = clean_cell(prow.get("PAS Fleet No", "")).upper()
+        score += 20
+        reasons.append("Job/PO base matched")
+    elif vjob and pjob and vjob != pjob:
+        score -= 15
+    vfleet = normalise_fleet(vrow.get("Vendor Fleet No", ""))
+    pfleet = normalise_fleet(prow.get("PAS Fleet No", ""))
     if vfleet and pfleet and vfleet == pfleet:
-        score += 8
-        reasons.append("Fleet matches")
-
+        score += 10
+        reasons.append("Fleet matched")
     return score, reasons
 
+
+def find_best_match(vrow, pas_df: pd.DataFrame) -> Tuple[Optional[pd.Series], float, str]:
+    if pas_df.empty:
+        return None, 0.0, "No PAS rows loaded"
+    candidates = pas_df.copy()
+    vjob = clean_cell(vrow.get("Vendor Job", ""))
+    if vjob:
+        job_matches = candidates[candidates["PAS Job Base"].fillna("").astype(str).str.upper().eq(vjob.upper())]
+        if not job_matches.empty:
+            candidates = job_matches
+    best = None
+    best_score = -999.0
+    best_reason = ""
+    for _, prow in candidates.iterrows():
+        score, reasons = score_candidate(vrow, prow)
+        if score > best_score:
+            best = prow
+            best_score = score
+            best_reason = "; ".join(reasons) or "Description compared"
+    return best, best_score, best_reason
+
+
 def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    results = []
-    ignored = []
-    seen = set()
-
+    checked_rows = []
+    ignored_rows = []
+    seen_keys = set()
     for _, vrow in vendor_df.iterrows():
-        rate = vrow.get("Vendor Rate Value")
-        if rate is not None and abs(float(rate)) < 0.005:
-            row = vrow.to_dict()
-            row["Status"] = "Ignored"
-            row["Reason"] = "£0 cost/rate ignored"
-            row["Colour"] = "Grey"
-            ignored.append(row)
+        if vendor_zero_cost(vrow):
+            ignored_rows.append({**vrow.to_dict(), "Ignored Reason": "£0 vendor line ignored"})
             continue
-
-        duplicate_key = "|".join([
-            clean_cell(vrow.get("Vendor Site", "")).lower(),
-            clean_cell(vrow.get("Vendor Fleet No", "")).lower(),
-            normalise_text(vrow.get("Vendor Description", "")),
-            clean_cell(vrow.get("Vendor Order No", "")).upper(),
-            clean_cell(vrow.get("Vendor Rate", "")).lower(),
-        ])
-        duplicate = bool(duplicate_key.strip("|") and duplicate_key in seen)
-        seen.add(duplicate_key)
-
-        candidates = []
-        for _, prow in pas_df.iterrows():
-            score, rs = score_candidate(vrow, prow)
-            desc_score = similarity(vrow.get("Vendor Description", ""), prow.get("PAS Description", ""))
-            vjob = job_base(vrow.get("Vendor Job", "")) or job_base(vrow.get("Vendor Site", ""))
-            pjob = job_base(prow.get("PAS Job No", ""))
-            vhire = clean_cell(vrow.get("Vendor Hire No", "")).upper()
-            phire = clean_cell(prow.get("PAS Order Number", "")).upper()
-            same_order_or_job = bool((vhire and phire and vhire == phire) or (vjob and pjob and vjob == pjob))
-            # Much more permissive: this app is only checking whether it is live on hire.
-            if same_order_or_job or score >= 42 or desc_score >= 0.55:
-                candidates.append((score, rs, prow, desc_score, same_order_or_job))
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best = candidates[0] if candidates else None
-
+        best, score, reason = find_best_match(vrow, pas_df)
         status = "Unmatched"
-        colour = "Red"
-        reason = "No live PAS item found"
-        match_score = 0
+        result_reason = "No live PAS item found"
         fleet_mismatch = False
-        prow = None
-
-        if duplicate:
-            reason = "Duplicate/problem item - exact duplicate line found on vendor report"
-        elif best:
-            match_score, reason_bits, prow, desc_score, same_order_or_job = best
-            status_text = clean_cell(prow.get("PAS Status", ""))
-            status_low = status_text.lower()
-            combined_text = " ".join([
-                clean_cell(vrow.get("Vendor Description", "")),
-                clean_cell(prow.get("PAS Description", "")),
-                clean_cell(prow.get("PAS Status", "")),
-            ]).lower()
-            v_fleet = clean_cell(vrow.get("Vendor Fleet No", "")).upper()
-            p_fleet = clean_cell(prow.get("PAS Fleet No", "")).upper()
-            fleet_mismatch = bool(v_fleet and p_fleet and v_fleet != p_fleet)
-            base_reason = "; ".join(reason_bits) if reason_bits else "Best live PAS match found"
-
-            if "operated plant" in combined_text or ("operated" in combined_text and "plant" in combined_text):
-                status, colour, reason = "Unmatched", "Red", "Operated plant item - query"
-            elif pas_is_off_hired(status_text):
-                status, colour, reason = "Unmatched", "Red", "PAS item is off-hired but still appears on vendor report"
-            elif not pas_is_live(status_text):
-                status, colour, reason = "Unmatched", "Red", f"PAS status is '{status_text or 'blank'}' - not live on hire"
-            elif same_order_or_job:
-                status, colour = "Matched", "Green"
-                if desc_score < 0.30:
-                    reason = f"{base_reason}; Accessory/grouped line matched to live PAS order"
-                else:
-                    reason = f"{base_reason}; Item is live on PAS"
-                if fleet_mismatch:
-                    reason += "; Fleet mismatch highlighted only"
-            elif desc_score >= 0.45:
-                status, colour = "Matched", "Green"
-                reason = f"{base_reason}; Vague description match and item is live on PAS"
-                if fleet_mismatch:
-                    reason += "; Fleet mismatch highlighted only"
+        duplicate_problem = False
+        if best is not None:
+            desc_ok = similarity(vrow.get("Vendor Description", ""), best.get("PAS Description", "")) >= 0.42
+            job_ok = True
+            vjob = clean_cell(vrow.get("Vendor Job", ""))
+            pjob = clean_cell(best.get("PAS Job Base", "")) or extract_job(best.get("PAS Job No", ""))
+            if vjob and pjob:
+                job_ok = vjob.upper() == pjob.upper()
+            if is_operated_plant_text(vrow.get("Vendor Description", ""), best.get("PAS Description", ""), best.get("PAS Status", "")):
+                status = "Unmatched"
+                result_reason = "Operated plant"
+            elif is_off_hired_status(best.get("PAS Status", "")):
+                status = "Unmatched"
+                result_reason = "PAS item is off-hired"
+            elif not is_live_status(best.get("PAS Status", "")):
+                status = "Unmatched"
+                result_reason = "No live PAS item found"
+            elif not job_ok:
+                status = "Unmatched"
+                result_reason = "Wrong/missing PO with no sensible match"
+            elif score < 36 or not desc_ok:
+                status = "Unmatched"
+                result_reason = "No live PAS item found"
             else:
-                status, colour, reason = "Unmatched", "Red", "Wrong/missing PO with no sensible live PAS match"
-
-        out = vrow.to_dict()
-        out.update({
+                key = (clean_cell(best.get("PAS Row No", "")), normalise_text(vrow.get("Vendor Description", "")), clean_cell(vrow.get("Vendor Order No", "")))
+                if key in seen_keys:
+                    duplicate_problem = True
+                seen_keys.add(key)
+                if duplicate_problem:
+                    status = "Unmatched"
+                    result_reason = "Duplicate/problem item"
+                else:
+                    status = "Matched"
+                    result_reason = "Live PAS item found"
+                vfleet = normalise_fleet(vrow.get("Vendor Fleet No", ""))
+                pfleet = normalise_fleet(best.get("PAS Fleet No", ""))
+                fleet_mismatch = bool(vfleet and pfleet and vfleet != pfleet)
+        record = {
             "Status": status,
-            "Colour": colour,
-            "Reason": reason,
-            "Fleet Mismatch": "Yes" if fleet_mismatch else "",
-            "Match Score": round(float(match_score), 1),
-            "PAS Description": clean_cell(prow.get("PAS Description", "")) if prow is not None else "",
-            "PAS Fleet No": clean_cell(prow.get("PAS Fleet No", "")) if prow is not None else "",
-            "PAS Supplier": clean_cell(prow.get("PAS Supplier", "")) if prow is not None else "",
-            "PAS Qty": clean_cell(prow.get("PAS Qty", "")) if prow is not None else "",
-            "PAS On Hire Date": format_date(prow.get("PAS On Hire Date", "")) if prow is not None else "",
-            "PAS Off Hire Date": format_date(prow.get("PAS Off Hire Date", "")) if prow is not None else "",
-            "PAS Status": clean_cell(prow.get("PAS Status", "")) if prow is not None else "",
-            "PAS Job No": clean_cell(prow.get("PAS Job No", "")) if prow is not None else "",
-            "PAS Order Number": clean_cell(prow.get("PAS Order Number", "")) if prow is not None else "",
-        })
-        results.append(out)
-
-    return pd.DataFrame(results), pd.DataFrame(ignored)
-
-# ---------- excel output ----------
-def style_workbook(writer, sheet_dfs: Dict[str, pd.DataFrame], colour_col_map: Dict[str, str] = None):
-    if not all([PatternFill, Font, Alignment, Border, Side, get_column_letter]): return
-    colour_col_map = colour_col_map or {}
-    fills = {
-        "header": PatternFill("solid", fgColor="FFD400"),
-        "Green": PatternFill("solid", fgColor="C6EFCE"),
-        "Red": PatternFill("solid", fgColor="FFC7CE"),
-        "Orange": PatternFill("solid", fgColor="FCE4D6"),
-        "Grey": PatternFill("solid", fgColor="E7E6E6"),
-    }
-    header_font = Font(name="Calibri", size=10, bold=True, color="000000")
-    body_font = Font(name="Calibri", size=10, color="000000")
-    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
-    for sheet, df in sheet_dfs.items():
-        ws = writer.book[sheet]
-        ws.freeze_panes = "A2"
-        ws.row_dimensions[1].height = 25
-        colour_col = colour_col_map.get(sheet)
-        colour_idx = list(df.columns).index(colour_col) + 1 if colour_col and colour_col in df.columns else None
-        for row in ws.iter_rows():
-            row_colour = None
-            if row[0].row == 1:
-                row_colour = "header"
-            elif colour_idx:
-                row_colour = clean_cell(ws.cell(row=row[0].row, column=colour_idx).value)
-            for cell in row:
-                cell.font = header_font if cell.row == 1 else body_font
-                cell.alignment = align
-                cell.border = border
-                if row_colour in fills:
-                    cell.fill = fills[row_colour]
-        ws.auto_filter.ref = ws.dimensions
-        for idx, col in enumerate(df.columns, start=1):
-            values = [str(col)] + [str(v) for v in df[col].fillna("").astype(str).tolist()[:200]]
-            width = min(max(len(v) for v in values) + 2, 50)
-            ws.column_dimensions[get_column_letter(idx)].width = width
-
-def style_workbook(writer, sheet_dfs: Dict[str, pd.DataFrame], colour_col_map: Dict[str, str] = None):
-    if not all([PatternFill, Font, Alignment, Border, Side, get_column_letter]): return
-    colour_col_map = colour_col_map or {}
-    fills = {
-        "header": PatternFill("solid", fgColor="FFD400"),
-        "Green": PatternFill("solid", fgColor="C6EFCE"),
-        "Red": PatternFill("solid", fgColor="FFC7CE"),
-        "Orange": PatternFill("solid", fgColor="FCE4D6"),
-        "Grey": PatternFill("solid", fgColor="E7E6E6"),
-    }
-    header_font = Font(name="Calibri", size=10, bold=True, color="000000")
-    body_font = Font(name="Calibri", size=10, color="000000")
-    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    border = Border(left=Side(style="thin", color="D9D9D9"), right=Side(style="thin", color="D9D9D9"), top=Side(style="thin", color="D9D9D9"), bottom=Side(style="thin", color="D9D9D9"))
-    for sheet, df in sheet_dfs.items():
-        ws = writer.book[sheet[:31]]
-        ws.freeze_panes = "A2"
-        ws.row_dimensions[1].height = 25
-        colour_col = colour_col_map.get(sheet)
-        colour_idx = list(df.columns).index(colour_col) + 1 if colour_col and colour_col in df.columns else None
-        fleet_idx = list(df.columns).index("Vendor Fleet No") + 1 if "Vendor Fleet No" in df.columns else None
-        mismatch_idx = list(df.columns).index("Fleet Mismatch") + 1 if "Fleet Mismatch" in df.columns else None
-        for row in ws.iter_rows():
-            row_num = row[0].row
-            row_colour = "header" if row_num == 1 else None
-            if row_num > 1 and colour_idx:
-                row_colour = clean_cell(ws.cell(row=row_num, column=colour_idx).value)
-            for cell in row:
-                cell.font = header_font if row_num == 1 else body_font
-                cell.alignment = align
-                cell.border = border
-                if row_colour in fills:
-                    cell.fill = fills[row_colour]
-            if row_num > 1 and fleet_idx and mismatch_idx:
-                if clean_cell(ws.cell(row=row_num, column=mismatch_idx).value).lower() == "yes":
-                    ws.cell(row=row_num, column=fleet_idx).fill = fills["Orange"]
-        ws.auto_filter.ref = ws.dimensions
-        for idx, col in enumerate(df.columns, start=1):
-            values = [str(col)] + [str(v) for v in df[col].fillna("").astype(str).tolist()[:300]]
-            width = min(max(len(v) for v in values) + 2, 55)
-            ws.column_dimensions[get_column_letter(idx)].width = width
+            "Reason": result_reason,
+            "Fleet Mismatch": "Yes" if fleet_mismatch and status == "Matched" else "",
+            "Match Score": round(float(score), 1),
+            "Vendor Site": vrow.get("Vendor Site", ""),
+            "Vendor Order No": vrow.get("Vendor Order No", ""),
+            "Vendor Contract No": vrow.get("Vendor Contract No", ""),
+            "Vendor Fleet No": vrow.get("Vendor Fleet No", ""),
+            "Vendor Description": vrow.get("Vendor Description", ""),
+            "Vendor Qty": vrow.get("Vendor Qty", ""),
+            "Vendor On Hire Date": vrow.get("Vendor On Hire Date", ""),
+            "PAS Job No": best.get("PAS Job No", "") if best is not None else "",
+            "PAS Site Name": best.get("PAS Site Name", "") if best is not None else "",
+            "PAS Status": best.get("PAS Status", "") if best is not None else "",
+            "PAS Fleet No": best.get("PAS Fleet No", "") if best is not None else "",
+            "PAS Description": best.get("PAS Description", "") if best is not None else "",
+            "PAS On Hire Date": best.get("PAS On Hire Date", "") if best is not None else "",
+            "PAS Off Hire Date": best.get("PAS Off Hire Date", "") if best is not None else "",
+        }
+        checked_rows.append(record)
+    return pd.DataFrame(checked_rows), pd.DataFrame(ignored_rows)
 
 
-def make_excel(results_df: pd.DataFrame, ignored_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    cols = [
-        "Status", "Reason", "Vendor Site", "Vendor Fleet No", "Fleet Mismatch", "Vendor Description", "Vendor Qty", "Vendor On Hire Date",
-        "Vendor Contract No", "Vendor Order No", "Vendor Rate", "Vendor Rate Value", "Match Score",
-        "PAS Description", "PAS Fleet No", "PAS Supplier", "PAS Qty", "PAS On Hire Date", "PAS Off Hire Date", "PAS Status", "PAS Job No", "PAS Order Number", "Colour"
-    ]
-    export = results_df.copy()
-    for c in cols:
-        if c not in export.columns: export[c] = ""
-    export = export[cols]
-    matched = export[export["Status"] == "Matched"].copy()
-    unmatched = export[export["Status"] == "Unmatched"].copy()
-    ignored = ignored_df.copy()
-    if ignored.empty:
-        ignored = pd.DataFrame(columns=["Status", "Reason", "Vendor Site", "Vendor Fleet No", "Vendor Description", "Vendor Order No", "Vendor Rate", "Vendor Rate Value"])
-    sheet_dfs = {
-        "Summary": summary_df,
-        "Vendor Report Checked": export,
-        "Matched": matched,
-        "Unmatched": unmatched,
-        "Ignored £0 Items": ignored,
-    }
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet, df in sheet_dfs.items():
-            df.to_excel(writer, index=False, sheet_name=sheet[:31])
-        style_workbook(writer, sheet_dfs, {"Vendor Report Checked": "Colour", "Matched": "Colour", "Unmatched": "Colour"})
-    return output.getvalue()
+def autosize_ws(ws):
+    for col_cells in ws.columns:
+        letter = col_cells[0].column_letter
+        max_len = 0
+        for cell in col_cells:
+            max_len = max(max_len, len(clean_cell(cell.value)))
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 10), 55)
 
-# ---------- UI ----------
+
+def make_output_excel(checked_df: pd.DataFrame, ignored_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+        checked_df.to_excel(writer, index=False, sheet_name="Vendor Report Checked")
+        checked_df[checked_df["Status"] == "Matched"].to_excel(writer, index=False, sheet_name="Matched")
+        checked_df[checked_df["Status"] == "Unmatched"].to_excel(writer, index=False, sheet_name="Unmatched")
+        if not ignored_df.empty:
+            ignored_df.to_excel(writer, index=False, sheet_name="Ignored £0 Items")
+        wb = writer.book
+        thin = Side(style="thin", color="D9D9D9")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        header_fill = PatternFill("solid", fgColor=HEADER_FILL)
+        green = PatternFill("solid", fgColor=GREEN_FILL)
+        red = PatternFill("solid", fgColor=RED_FILL)
+        orange = PatternFill("solid", fgColor=ORANGE_FILL)
+        for ws in wb.worksheets:
+            ws.freeze_panes = "A2"
+            ws.row_dimensions[1].height = 25
+            ws.auto_filter.ref = ws.dimensions
+            headers = [clean_cell(c.value) for c in ws[1]]
+            status_col = headers.index("Status") + 1 if "Status" in headers else None
+            vendor_fleet_col = headers.index("Vendor Fleet No") + 1 if "Vendor Fleet No" in headers else None
+            fleet_mismatch_col = headers.index("Fleet Mismatch") + 1 if "Fleet Mismatch" in headers else None
+            for row in ws.iter_rows():
+                for cell in row:
+                    cell.font = Font(name="Calibri", size=10, bold=(cell.row == 1), color="000000")
+                    cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                    cell.border = border
+                    if cell.row == 1:
+                        cell.fill = header_fill
+                if cell.row == 1:
+                    continue
+                if status_col:
+                    status = clean_cell(ws.cell(cell.row, status_col).value)
+                    fill = green if status == "Matched" else red if status == "Unmatched" else None
+                    if fill:
+                        for c in range(1, ws.max_column + 1):
+                            ws.cell(cell.row, c).fill = fill
+                    if vendor_fleet_col and fleet_mismatch_col and clean_cell(ws.cell(cell.row, fleet_mismatch_col).value) == "Yes":
+                        ws.cell(cell.row, vendor_fleet_col).fill = orange
+            autosize_ws(ws)
+    return out.getvalue()
+
+
+def render_results_table(df: pd.DataFrame):
+    if df is None or df.empty:
+        st.markdown('<div class="pas-unmatched-pill">Unmatched Items</div>', unsafe_allow_html=True)
+        st.markdown('<div class="pas-table-wrap"><table class="pas-table"><tbody><tr><td>No unmatched items found.</td></tr></tbody></table></div>', unsafe_allow_html=True)
+        return
+    display_cols = ["Reason", "Vendor Order No", "Vendor Fleet No", "Vendor Description", "PAS Status", "PAS Job No", "PAS Description"]
+    display_df = df[df["Status"] == "Unmatched"].copy()
+    if display_df.empty:
+        st.markdown('<div class="pas-unmatched-pill">Unmatched Items</div>', unsafe_allow_html=True)
+        st.markdown('<div class="pas-table-wrap"><table class="pas-table"><tbody><tr><td>No unmatched items found.</td></tr></tbody></table></div>', unsafe_allow_html=True)
+        return
+    display_df = display_df[[c for c in display_cols if c in display_df.columns]].head(200)
+    header_html = "".join(f"<th>{escape(c)}</th>" for c in display_df.columns)
+    rows_html = []
+    for _, row in display_df.iterrows():
+        rows_html.append("<tr>" + "".join(f"<td>{escape(clean_cell(row.get(c, '')))}</td>" for c in display_df.columns) + "</tr>")
+    st.markdown('<div class="pas-unmatched-pill">Unmatched Items</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="pas-table-wrap"><table class="pas-table"><thead><tr>{header_html}</tr></thead><tbody>{"".join(rows_html)}</tbody></table></div>', unsafe_allow_html=True)
+
+
+# ===== UI: same uploaded layout, vendor checker content only =====
 up_col1, up_col2 = st.columns(2)
 with up_col1:
     st.markdown('<div class="pas-upload-card"><div class="pas-upload-title">Upload Vendor Hire Report</div>', unsafe_allow_html=True)
     vendor_file = st.file_uploader("Upload Vendor Hire Report", type=["xlsx", "xls", "pdf"], label_visibility="collapsed", key="vendor_upload")
-    if vendor_file: render_selected_file_card(vendor_file, "pdf" if vendor_file.name.lower().endswith(".pdf") else "excel")
+    if vendor_file:
+        render_selected_file_card(vendor_file, "excel")
     st.markdown('</div>', unsafe_allow_html=True)
 with up_col2:
-    st.markdown('<div class="pas-upload-card"><div class="pas-upload-title">Upload Materials & Plant Orders</div>', unsafe_allow_html=True)
-    pas_file = st.file_uploader("Upload Materials & Plant Orders", type=["xlsx", "xls"], label_visibility="collapsed", key="pas_upload")
-    if pas_file: render_selected_file_card(pas_file, "excel")
+    st.markdown('<div class="pas-upload-card"><div class="pas-upload-title">Upload Material & Plant Orders workbook</div>', unsafe_allow_html=True)
+    orders_file = st.file_uploader("Upload Material & Plant Orders", type=["xlsx", "xlsm", "xls"], label_visibility="collapsed", key="orders_upload")
+    if orders_file:
+        render_selected_file_card(orders_file, "excel")
     st.markdown('</div>', unsafe_allow_html=True)
 
-run = st.button("▶  Run reconciliation", use_container_width=True)
-if "vendor_checker_results" not in st.session_state:
-    st.session_state["vendor_checker_results"] = None
+run = st.button("▶  Run on-hire check", use_container_width=True)
+
+if "vendor_on_hire_results" not in st.session_state:
+    st.session_state["vendor_on_hire_results"] = None
 
 if run:
-    if not vendor_file or not pas_file:
-        st.warning("Please upload both the vendor hire report and the Materials & Plant Orders spreadsheet.")
+    if not vendor_file or not orders_file:
+        st.warning("Please upload both the vendor hire report and the Material & Plant Orders workbook.")
         st.stop()
     try:
         with st.spinner("Reading vendor hire report..."):
             raw_vendor, vendor_df = load_vendor_report(vendor_file)
-        with st.spinner("Reading PAS Materials & Plant Orders..."):
-            pas_df = load_pas_plant(pas_file)
+        with st.spinner("Reading PAS Material & Plant Orders..."):
+            pas_df = load_pas_plant(orders_file)
         with st.spinner("Checking whether vendor items are still live on PAS report..."):
-            results_df, ignored_df = reconcile(vendor_df, pas_df)
-        total_checked = len(results_df)
-        matched = int((results_df["Status"] == "Matched").sum()) if not results_df.empty else 0
-        unmatched = int((results_df["Status"] == "Unmatched").sum()) if not results_df.empty else 0
-        fleet_mismatches = int((results_df.get("Fleet Mismatch", "") == "Yes").sum()) if not results_df.empty else 0
+            checked_df, ignored_df = reconcile(vendor_df, pas_df)
+        if checked_df.empty:
+            st.warning("No chargeable vendor lines were found after ignoring £0 lines.")
+            st.stop()
+        total = len(checked_df)
+        matched = int((checked_df["Status"] == "Matched").sum())
+        unmatched = int((checked_df["Status"] == "Unmatched").sum())
         ignored = len(ignored_df)
-        match_pct = round((matched / total_checked) * 100, 1) if total_checked else 0.0
+        match_pct = round((matched / total) * 100, 1) if total else 0.0
         summary_df = pd.DataFrame({
-            "Metric": ["Total chargeable lines checked", "Matched lines", "Unmatched lines", "Fleet mismatches highlighted only", "Ignored £0 lines", "Match percentage", "Run date/time"],
-            "Value": [total_checked, matched, unmatched, fleet_mismatches, ignored, f"{match_pct}%", datetime.now().strftime("%d/%m/%Y %H:%M")]
+            "Metric": ["Chargeable lines checked", "Matched", "Unmatched", "Ignored £0 lines", "Match percentage", "Run date/time"],
+            "Value": [total, matched, unmatched, ignored, f"{match_pct}%", datetime.now().strftime("%d/%m/%Y %H:%M")],
         })
-        excel_bytes = make_excel(results_df, ignored_df, summary_df)
+        excel_bytes = make_output_excel(checked_df, ignored_df, summary_df)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
-        st.session_state["vendor_checker_results"] = {
-            "results_df": results_df, "ignored_df": ignored_df, "summary_df": summary_df, "excel_bytes": excel_bytes,
-            "total": total_checked, "matched": matched, "unmatched": unmatched, "fleet_mismatches": fleet_mismatches, "ignored": ignored,
-            "match_pct": match_pct, "filename": f"PAS_Vendor_On_Hire_Checked_{stamp}.xlsx"
+        st.session_state["vendor_on_hire_results"] = {
+            "checked_df": checked_df,
+            "ignored_df": ignored_df,
+            "summary_df": summary_df,
+            "excel_bytes": excel_bytes,
+            "total": total,
+            "matched": matched,
+            "unmatched": unmatched,
+            "ignored": ignored,
+            "match_pct": match_pct,
+            "excel_filename": f"PAS_Vendor_On_Hire_Checked_{stamp}.xlsx",
         }
     except Exception as e:
         st.error(f"Something went wrong: {e}")
         st.exception(e)
 
-res = st.session_state.get("vendor_checker_results")
-if res:
+results = st.session_state.get("vendor_on_hire_results")
+
+if results is not None:
     c1, c2, c3, c4 = st.columns(4)
-    with c1: st.markdown(f'<div class="kpi-card"><div class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M8 7V3h8l4 4v14H6V7z"/><path d="M16 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/></svg></div><div><div class="kpi-label">Checked</div><div class="kpi-value">{res["total"]}</div><div class="kpi-sub">Chargeable lines</div></div></div>', unsafe_allow_html=True)
-    with c2: st.markdown(f'<div class="kpi-card kpi-green"><div class="kpi-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.7 2.7L16.5 9"/></svg></div><div><div class="kpi-label">Matched</div><div class="kpi-value">{res["matched"]}</div><div class="kpi-sub">Still live on PAS</div></div></div>', unsafe_allow_html=True)
-    with c3: st.markdown(f'<div class="kpi-card kpi-red"><div class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M12 3l10 18H2L12 3z"/><path d="M12 9v5"/><path d="M12 18h.01"/></svg></div><div><div class="kpi-label">Unmatched</div><div class="kpi-value">{res["unmatched"]}</div><div class="kpi-sub">Needs query</div></div></div>', unsafe_allow_html=True)
-    with c4: st.markdown(f'<div class="kpi-card"><div class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M3 20h18"/><path d="M6 16v-4"/><path d="M11 16V8"/><path d="M16 16v-6"/><path d="M19 6l-5 5-3-3-5 5"/></svg></div><div><div class="kpi-label">Match %</div><div class="kpi-value">{res["match_pct"]}%</div><div class="kpi-sub">Core KPI</div></div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="pas-results-title">Results Preview</div>', unsafe_allow_html=True)
-    preview_cols = ["Status", "Reason", "Vendor Site", "Vendor Fleet No", "Fleet Mismatch", "Vendor Description", "Vendor Order No", "Vendor Rate", "PAS Description", "PAS Fleet No", "PAS Status", "PAS Job No", "Colour"]
-    df = res["results_df"].copy()
-    for c in preview_cols:
-        if c not in df.columns: df[c] = ""
-    rows = []
-    for _, row in df[preview_cols].head(100).iterrows():
-        cls = "green" if clean_cell(row.get("Colour", "")) == "Green" else "red"
-        cells = "".join(f"<td>{escape(clean_cell(row.get(col, '')))}</td>" for col in preview_cols[:-1])
-        rows.append(f"<tr class='{cls}'>{cells}</tr>")
-    header = "".join(f"<th>{escape(c)}</th>" for c in preview_cols[:-1])
-    st.markdown('<div class="pas-pill">Vendor Report Checked</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="pas-table-wrap"><table class="pas-table"><thead><tr>{header}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>', unsafe_allow_html=True)
-    st.caption(f"Ignored £0 lines: {res['ignored']} | Fleet mismatches: {res['fleet_mismatches']} highlighted orange in the Excel only. Price is ignored except for removing £0 lines.")
+    with c1:
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M8 7V3h8l4 4v14H6V7z"/><path d="M16 3v5h5"/><path d="M9 13h6"/><path d="M9 17h4"/><path d="M4 7h2v14h12"/></svg></div><div><div class="kpi-label">Lines checked</div><div class="kpi-value">{results["total"]}</div><div class="kpi-sub">£0 lines ignored</div></div></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.7 2.7L16.5 9"/></svg></div><div><div class="kpi-label">Matched</div><div class="kpi-value">{results["matched"]}</div><div class="kpi-sub">Still live/on hire</div></div></div>', unsafe_allow_html=True)
+    with c3:
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M12 3l10 18H2L12 3z"/><path d="M12 9v5"/><path d="M12 18h.01"/></svg></div><div><div class="kpi-label">Unmatched</div><div class="kpi-value">{results["unmatched"]}</div><div class="kpi-sub">Needs checking</div></div></div>', unsafe_allow_html=True)
+    with c4:
+        st.markdown(f'<div class="kpi-card"><div class="kpi-icon"><svg viewBox="0 0 24 24"><path d="M3 20h18"/><path d="M6 16v-4"/><path d="M11 16V8"/><path d="M16 16v-6"/><path d="M19 6l-5 5-3-3-5 5"/></svg></div><div><div class="kpi-label">Match %</div><div class="kpi-value">{results["match_pct"]}%</div><div class="kpi-sub">Core KPI</div></div></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="pas-results-title">Results</div>', unsafe_allow_html=True)
+    render_results_table(results["checked_df"])
+
     dl_left, dl_mid, dl_right = st.columns([1.3, 1, 1.3])
     with dl_mid:
-        st.download_button("⬇  Download checked Excel", data=res["excel_bytes"], file_name=res["filename"], mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button(
+            "⬇  Download Excel",
+            data=results["excel_bytes"],
+            file_name=results["excel_filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 else:
-    st.info("Upload a vendor hire report and Materials & Plant Orders spreadsheet, then click Run reconciliation.")
+    st.info("Upload vendor hire report and Material & Plant Orders, then click Run on-hire check.")
 
 
 if "animation_shown" not in st.session_state:
