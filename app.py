@@ -567,6 +567,33 @@ def is_off_hired_status(status: str) -> bool:
     return "off" in s and "hire" in s
 
 
+def parse_possible_date(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = clean_cell(value)
+    if not text:
+        return None
+    parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def is_effectively_live_pas_row(row) -> bool:
+    status = row.get("PAS Status", "")
+    if is_live_status(status):
+        return True
+    if is_off_hired_status(status):
+        off_hire_date = parse_possible_date(row.get("PAS Off Hire Date", ""))
+        if off_hire_date and off_hire_date >= datetime.now().date():
+            return True
+    return False
+
+
 def is_operated_plant_text(*values) -> bool:
     blob = " ".join(clean_cell(v).lower() for v in values)
     return "operated plant" in blob or "operated" in blob and "plant" in blob
@@ -723,12 +750,12 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
             if is_operated_plant_text(vrow.get("Vendor Description", ""), best.get("PAS Description", ""), best.get("PAS Status", "")):
                 status = "Unmatched"
                 result_reason = "Operated plant"
-            elif is_off_hired_status(best.get("PAS Status", "")):
+            elif not is_effectively_live_pas_row(best):
                 status = "Unmatched"
-                result_reason = "PAS item is off-hired"
-            elif not is_live_status(best.get("PAS Status", "")):
-                status = "Unmatched"
-                result_reason = "No live PAS item found"
+                if is_off_hired_status(best.get("PAS Status", "")):
+                    result_reason = "PAS item is off-hired"
+                else:
+                    result_reason = "No live PAS item found"
             elif not job_ok:
                 status = "Unmatched"
                 result_reason = "Wrong/missing PO with no sensible match"
@@ -861,6 +888,26 @@ with up_col2:
     if orders_file:
         render_selected_file_card(orders_file, "excel")
     st.markdown('</div>', unsafe_allow_html=True)
+
+if vendor_file and orders_file:
+    st.markdown(
+        """
+        <style>
+        /* Hide Streamlit uploader boxes once both documents are selected.
+           The PAS file cards above remain visible. */
+        div[data-testid="stFileUploader"] {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
+            min-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow: hidden !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 run = st.button("▶  Run on-hire check", use_container_width=True)
 
