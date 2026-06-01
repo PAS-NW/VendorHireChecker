@@ -623,16 +623,15 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
 
 
 
+
 def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
-    """Convert a supplier live-hire PDF into clean line-level rows before matching.
+    """Convert supplier live-hire PDFs into clean line-level rows before matching.
 
-    Handles reports laid out like:
-    Contract No ... Order No: P111/H3547 Delivery Address ...
-    AMB2842 3TON TRACKED MINI EXCAVATOR 1.00 220.00 0.00% 220.00 N/A 06/05/2026 00:00:00 Hire
+    Handles both known supplier styles used so far:
+    1) Ambrose-style live hire detail reports with Order No blocks and weekly/net rates.
+    2) Table-style equipment-on-hire PDFs with Site / Cat / Stock No / Qty / Description / Date / Contract / Order.
 
-    The earlier fallback treated every PDF text line as an item, which caused headers,
-    addresses and wrapped text to be queried. This parser keeps the current order/contract
-    context and only returns genuine item rows.
+    The function returns the same normalised vendor schema used by Excel imports.
     """
     try:
         from pypdf import PdfReader
@@ -646,46 +645,103 @@ def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
     uploaded_file.seek(0)
     reader = PdfReader(io.BytesIO(pdf_bytes))
 
-    rows = []
-    current_contract = ""
-    current_order = ""
-    current_site = ""
-    pending_address_parts = []
-
-    item_re = re.compile(
-        r'^(?P<item>[A-Z0-9][A-Z0-9/-]{1,20})\s+'
-        r'(?P<desc>.+?)\s+'
-        r'(?P<qty>-?\d+(?:\.\d+)?)\s+'
-        r'(?P<weekly>-?\d+(?:\.\d+)?)\s+'
-        r'(?P<discount>-?\d+(?:\.\d+)?%)\s+'
-        r'(?P<net>-?\d+(?:\.\d+)?)\s+'
-        r'(?P<lastinv>N/A|\d{1,2}/\d{1,2}/\d{2,4})\s+'
-        r'(?P<onhire>\d{1,2}/\d{1,2}/\d{2,4})'
-        r'(?:\s+\d{1,2}:\d{2}:\d{2})?\s+'
-        r'(?P<type>[A-Za-z]+)\s*$',
-        re.I,
-    )
-    contract_re = re.compile(
-        r'^(?P<contract>\d{6,12})\s+.*?(?:\bOrder\s+No:\s*(?P<order_after>[A-Za-z0-9/&.-]+)|(?P<order_before>[A-Za-z0-9]+/H\d+)\s*Order\s+No:)(?P<tail>.*)$',
-        re.I,
-    )
-    page_footer_re = re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}\s+Page\s+\d+\s+of\s+\d+', re.I)
-
-    def commit_site_from_pending():
-        nonlocal current_site, pending_address_parts
-        if pending_address_parts:
-            current_site = " ".join(pending_address_parts).strip(" ,")
-            pending_address_parts = []
-
+    all_lines = []
     for page_no, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
-        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-        for line in lines:
-            if not line:
-                continue
-            low = line.lower()
+        for raw_line in text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if line:
+                all_lines.append((page_no, line))
 
-            # Skip report furniture.
+    rows = []
+
+    # ------------------------------------------------------------------
+    # Parser A: table-style equipment-on-hire PDFs.
+    # Example:
+    # Site: PEEL HALL, WARRINGTON, WA2 9UF
+    # BAT2 HNB01133 1.00 HILTI NURON B 22-110 22V BATTERY 05-Jan-26 008-703731 P151/H7044
+    # ------------------------------------------------------------------
+    current_site = ""
+    table_item_re = re.compile(
+        r'^(?P<cat>[A-Z0-9][A-Z0-9/-]{1,20})\s+'
+        r'(?P<stock>[A-Z0-9][A-Z0-9/-]{1,30})\s+'
+        r'(?P<qty>-?\d+(?:\.\d+)?)\s+'
+        r'(?P<desc>.+?)\s+'
+        r'(?P<onhire>\d{1,2}[-/][A-Za-z]{3}[-/]\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4})\s+'
+        r'(?P<contract>[A-Za-z0-9-]+)\s+'
+        r'(?P<order>[A-Za-z0-9/&.-]+)\s*$',
+        re.I,
+    )
+    table_header_seen = False
+    for page_no, line in all_lines:
+        low = line.lower()
+        if low.startswith("site:"):
+            current_site = line.split(":", 1)[1].strip()
+            continue
+        if "cat stock no qty description date on hire contract no order no" in low:
+            table_header_seen = True
+            continue
+        if not table_header_seen:
+            continue
+        if low.startswith("equipment currently on hire") or low.startswith("cat stock no"):
+            continue
+        m = table_item_re.match(line)
+        if not m:
+            continue
+        rows.append({
+            "Vendor Site": current_site,
+            "Vendor Fleet No": m.group("stock").strip(),
+            "Vendor Description": m.group("desc").strip(),
+            "Vendor Qty": m.group("qty"),
+            "Vendor On Hire Date": m.group("onhire"),
+            "Vendor Contract No": m.group("contract"),
+            "Vendor Order No": m.group("order"),
+            "Vendor Rate": "",
+            "Vendor Weekly Rate": "",
+            "Vendor Net Weekly": "",
+            "Vendor Last Inv Date": "",
+            "Vendor Type": "Hire",
+            "Vendor Cat": m.group("cat").strip(),
+            "Source Page": page_no,
+        })
+
+    # ------------------------------------------------------------------
+    # Parser B: Ambrose-style live hire detail reports.
+    # Only run if the table parser did not find anything.
+    # ------------------------------------------------------------------
+    if not rows:
+        current_contract = ""
+        current_order = ""
+        current_site = ""
+        pending_address_parts = []
+
+        item_re = re.compile(
+            r'^(?P<item>[A-Z0-9][A-Z0-9/-]{1,20})\s+'
+            r'(?P<desc>.+?)\s+'
+            r'(?P<qty>-?\d+(?:\.\d+)?)\s+'
+            r'(?P<weekly>-?\d+(?:\.\d+)?)\s+'
+            r'(?P<discount>-?\d+(?:\.\d+)?%)\s+'
+            r'(?P<net>-?\d+(?:\.\d+)?)\s+'
+            r'(?P<lastinv>N/A|\d{1,2}/\d{1,2}/\d{2,4})\s+'
+            r'(?P<onhire>\d{1,2}/\d{1,2}/\d{2,4})'
+            r'(?:\s+\d{1,2}:\d{2}:\d{2})?\s+'
+            r'(?P<type>[A-Za-z]+)\s*$',
+            re.I,
+        )
+        contract_re = re.compile(
+            r'^(?P<contract>\d{6,12})\s+.*?(?:\bOrder\s+No:\s*(?P<order_after>[A-Za-z0-9/&.-]+)|(?P<order_before>[A-Za-z0-9]+/H\d+)\s*Order\s+No:)(?P<tail>.*)$',
+            re.I,
+        )
+        page_footer_re = re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}\s+Page\s+\d+\s+of\s+\d+', re.I)
+
+        def commit_site_from_pending():
+            nonlocal current_site, pending_address_parts
+            if pending_address_parts:
+                current_site = " ".join(pending_address_parts).strip(" ,")
+                pending_address_parts = []
+
+        for page_no, line in all_lines:
+            low = line.lower()
             if (
                 "live hire detail report" in low
                 or line in {"PAS002", "Type"}
@@ -704,9 +760,7 @@ def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
                 current_order = cm.group("order_after") or cm.group("order_before") or ""
                 current_site = ""
                 pending_address_parts = []
-
                 tail = cm.group("tail") or ""
-                # Capture the visible delivery/site address after "Delivery Address".
                 if "Delivery Address" in tail:
                     address = tail.split("Delivery Address", 1)[1].strip(" :,-")
                     if address:
@@ -716,11 +770,10 @@ def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
             im = item_re.match(line)
             if im:
                 commit_site_from_pending()
-                desc = im.group("desc").strip()
                 rows.append({
                     "Vendor Site": current_site,
                     "Vendor Fleet No": im.group("item").strip(),
-                    "Vendor Description": desc,
+                    "Vendor Description": im.group("desc").strip(),
                     "Vendor Qty": im.group("qty"),
                     "Vendor On Hire Date": im.group("onhire"),
                     "Vendor Contract No": current_contract,
@@ -734,24 +787,26 @@ def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
                 })
                 continue
 
-            # Contract addresses often wrap for one or more lines before the first item.
-            # Keep them as context, but never treat them as vendor hire rows.
             if current_order and not re.match(r'^\d{6,12}\s+', line):
-                # Avoid appending obvious repeated headers/footers.
                 if not item_re.match(line):
                     pending_address_parts.append(line)
 
     if not rows:
-        raise RuntimeError("Could not convert the PDF into hire lines. Try exporting the supplier report to Excel, or send me the PDF so I can add a vendor-specific parser.")
+        raise RuntimeError("Could not convert the PDF into hire lines. This PDF layout is not recognised yet.")
 
-    raw = pd.DataFrame(rows)
-    # Ensure the columns match the normalised app schema exactly.
-    raw["Vendor Rate Value"] = raw["Vendor Rate"].apply(money_to_float)
-    raw["Vendor Job"] = raw["Vendor Order No"].apply(extract_job)
-    raw["Vendor Hire No"] = raw["Vendor Order No"].apply(extract_hire_no)
-    raw["Vendor Row No"] = range(2, len(raw) + 2)
-    return raw
-
+    out = pd.DataFrame(rows)
+    for col in [
+        "Vendor Site", "Vendor Fleet No", "Vendor Description", "Vendor Qty", "Vendor On Hire Date",
+        "Vendor Contract No", "Vendor Order No", "Vendor Rate", "Vendor Weekly Rate", "Vendor Net Weekly",
+        "Vendor Last Inv Date", "Vendor Type", "Source Page"
+    ]:
+        if col not in out.columns:
+            out[col] = ""
+    out["Vendor Rate Value"] = out["Vendor Rate"].apply(money_to_float)
+    out["Vendor Job"] = out["Vendor Order No"].apply(extract_job)
+    out["Vendor Hire No"] = out["Vendor Order No"].apply(extract_hire_no)
+    out["Vendor Row No"] = range(2, len(out) + 2)
+    return out
 
 def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     name = uploaded_file.name.lower()
