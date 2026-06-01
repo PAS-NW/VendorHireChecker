@@ -622,30 +622,145 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
     return pd.read_excel(uploaded_file)
 
 
+
+def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
+    """Convert a supplier live-hire PDF into clean line-level rows before matching.
+
+    Handles reports laid out like:
+    Contract No ... Order No: P111/H3547 Delivery Address ...
+    AMB2842 3TON TRACKED MINI EXCAVATOR 1.00 220.00 0.00% 220.00 N/A 06/05/2026 00:00:00 Hire
+
+    The earlier fallback treated every PDF text line as an item, which caused headers,
+    addresses and wrapped text to be queried. This parser keeps the current order/contract
+    context and only returns genuine item rows.
+    """
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader
+        except Exception:
+            raise RuntimeError("PDF reader unavailable. Add pypdf to requirements.txt.")
+
+    pdf_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+
+    rows = []
+    current_contract = ""
+    current_order = ""
+    current_site = ""
+    pending_address_parts = []
+
+    item_re = re.compile(
+        r'^(?P<item>[A-Z0-9][A-Z0-9/-]{1,20})\s+'
+        r'(?P<desc>.+?)\s+'
+        r'(?P<qty>-?\d+(?:\.\d+)?)\s+'
+        r'(?P<weekly>-?\d+(?:\.\d+)?)\s+'
+        r'(?P<discount>-?\d+(?:\.\d+)?%)\s+'
+        r'(?P<net>-?\d+(?:\.\d+)?)\s+'
+        r'(?P<lastinv>N/A|\d{1,2}/\d{1,2}/\d{2,4})\s+'
+        r'(?P<onhire>\d{1,2}/\d{1,2}/\d{2,4})'
+        r'(?:\s+\d{1,2}:\d{2}:\d{2})?\s+'
+        r'(?P<type>[A-Za-z]+)\s*$',
+        re.I,
+    )
+    contract_re = re.compile(
+        r'^(?P<contract>\d{6,12})\s+.*?(?:\bOrder\s+No:\s*(?P<order_after>[A-Za-z0-9/&.-]+)|(?P<order_before>[A-Za-z0-9]+/H\d+)\s*Order\s+No:)(?P<tail>.*)$',
+        re.I,
+    )
+    page_footer_re = re.compile(r'^\d{1,2}/\d{1,2}/\d{2,4}\s+Page\s+\d+\s+of\s+\d+', re.I)
+
+    def commit_site_from_pending():
+        nonlocal current_site, pending_address_parts
+        if pending_address_parts:
+            current_site = " ".join(pending_address_parts).strip(" ,")
+            pending_address_parts = []
+
+    for page_no, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+        for line in lines:
+            if not line:
+                continue
+            low = line.lower()
+
+            # Skip report furniture.
+            if (
+                "live hire detail report" in low
+                or line in {"PAS002", "Type"}
+                or low.startswith("customer range")
+                or low.startswith("item no description")
+                or low.startswith("contract no acct no")
+                or low.startswith("depot:")
+                or page_footer_re.match(line)
+            ):
+                continue
+
+            cm = contract_re.match(line)
+            if cm:
+                commit_site_from_pending()
+                current_contract = cm.group("contract")
+                current_order = cm.group("order_after") or cm.group("order_before") or ""
+                current_site = ""
+                pending_address_parts = []
+
+                tail = cm.group("tail") or ""
+                # Capture the visible delivery/site address after "Delivery Address".
+                if "Delivery Address" in tail:
+                    address = tail.split("Delivery Address", 1)[1].strip(" :,-")
+                    if address:
+                        pending_address_parts.append(address)
+                continue
+
+            im = item_re.match(line)
+            if im:
+                commit_site_from_pending()
+                desc = im.group("desc").strip()
+                rows.append({
+                    "Vendor Site": current_site,
+                    "Vendor Fleet No": im.group("item").strip(),
+                    "Vendor Description": desc,
+                    "Vendor Qty": im.group("qty"),
+                    "Vendor On Hire Date": im.group("onhire"),
+                    "Vendor Contract No": current_contract,
+                    "Vendor Order No": current_order,
+                    "Vendor Rate": im.group("net"),
+                    "Vendor Weekly Rate": im.group("weekly"),
+                    "Vendor Net Weekly": im.group("net"),
+                    "Vendor Last Inv Date": im.group("lastinv"),
+                    "Vendor Type": im.group("type"),
+                    "Source Page": page_no,
+                })
+                continue
+
+            # Contract addresses often wrap for one or more lines before the first item.
+            # Keep them as context, but never treat them as vendor hire rows.
+            if current_order and not re.match(r'^\d{6,12}\s+', line):
+                # Avoid appending obvious repeated headers/footers.
+                if not item_re.match(line):
+                    pending_address_parts.append(line)
+
+    if not rows:
+        raise RuntimeError("Could not convert the PDF into hire lines. Try exporting the supplier report to Excel, or send me the PDF so I can add a vendor-specific parser.")
+
+    raw = pd.DataFrame(rows)
+    # Ensure the columns match the normalised app schema exactly.
+    raw["Vendor Rate Value"] = raw["Vendor Rate"].apply(money_to_float)
+    raw["Vendor Job"] = raw["Vendor Order No"].apply(extract_job)
+    raw["Vendor Hire No"] = raw["Vendor Order No"].apply(extract_hire_no)
+    raw["Vendor Row No"] = range(2, len(raw) + 2)
+    return raw
+
+
 def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     name = uploaded_file.name.lower()
     if name.endswith(".pdf"):
-        try:
-            from pypdf import PdfReader
-        except Exception:
-            try:
-                from PyPDF2 import PdfReader
-            except Exception:
-                raise RuntimeError("PDF reader unavailable. Add pypdf to requirements.txt.")
-        pdf_bytes = uploaded_file.read(); uploaded_file.seek(0)
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        rows = []
-        for page_no, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            for line in text.splitlines():
-                line = re.sub(r"\s+", " ", line).strip()
-                if not line:
-                    continue
-                rate = money_to_float(line)
-                rows.append({"Description": line, "Rate": rate, "Source Page": page_no})
-        raw = pd.DataFrame(rows)
-    else:
-        raw = read_excel_any(uploaded_file)
+        out = parse_vendor_live_hire_pdf(uploaded_file)
+        raw = out.copy()
+        return raw, out
+
+    raw = read_excel_any(uploaded_file)
     raw = raw.dropna(how="all").copy()
     cols = list(raw.columns)
     mapping = {
@@ -656,7 +771,7 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
         "Vendor On Hire Date": find_col(cols, ["Date", "On Hire Date", "Start Date", "Delivery Date", "Hired Date"]),
         "Vendor Contract No": find_col(cols, ["Syrinx Contract No", "Contract No", "Contract", "Hire Contract"]),
         "Vendor Order No": find_col(cols, ["Order No", "PO", "Purchase Order", "Order Number", "Customer Order"]),
-        "Vendor Rate": find_col(cols, ["Hire Rate", "Rate", "Weekly Rate", "Cost", "Value", "Charge", "Amount"]),
+        "Vendor Rate": find_col(cols, ["Hire Rate", "Rate", "Weekly Rate", "Cost", "Value", "Charge", "Amount", "Net Weekly"]),
     }
     out = pd.DataFrame()
     for new_col, old_col in mapping.items():
