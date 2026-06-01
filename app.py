@@ -567,9 +567,19 @@ def is_off_hired_status(status: str) -> bool:
     return "off" in s and "hire" in s
 
 
-def parse_possible_date(value):
+def is_operated_plant_text(*values) -> bool:
+    blob = " ".join(clean_cell(v).lower() for v in values)
+    return "operated plant" in blob or "operated" in blob and "plant" in blob
+
+
+def parse_any_date(value):
     if value is None:
         return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -583,20 +593,26 @@ def parse_possible_date(value):
     return parsed.date()
 
 
-def is_effectively_live_pas_row(row) -> bool:
-    status = row.get("PAS Status", "")
+def pas_item_live_as_of(prow, as_of_date=None) -> bool:
+    if as_of_date is None:
+        as_of_date = datetime.now().date()
+    status = clean_cell(prow.get("PAS Status", "")).lower().strip()
     if is_live_status(status):
         return True
     if is_off_hired_status(status):
-        off_hire_date = parse_possible_date(row.get("PAS Off Hire Date", ""))
-        if off_hire_date and off_hire_date >= datetime.now().date():
+        off_hire_date = parse_any_date(prow.get("PAS Off Hire Date", ""))
+        if off_hire_date and off_hire_date >= as_of_date:
             return True
     return False
 
 
-def is_operated_plant_text(*values) -> bool:
-    blob = " ".join(clean_cell(v).lower() for v in values)
-    return "operated plant" in blob or "operated" in blob and "plant" in blob
+def off_hire_reason(prow, as_of_date=None) -> str:
+    if as_of_date is None:
+        as_of_date = datetime.now().date()
+    off_hire_date = parse_any_date(prow.get("PAS Off Hire Date", ""))
+    if off_hire_date:
+        return f"PAS item is off-hired before check date ({off_hire_date.strftime('%d/%m/%Y')})"
+    return "PAS item is off-hired"
 
 
 def read_excel_any(uploaded_file) -> pd.DataFrame:
@@ -730,52 +746,53 @@ def find_best_match(vrow, pas_df: pd.DataFrame) -> Tuple[Optional[pd.Series], fl
 def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     checked_rows = []
     ignored_rows = []
-    seen_keys = set()
+    as_of_date = datetime.now().date()
+
     for _, vrow in vendor_df.iterrows():
         if vendor_zero_cost(vrow):
             ignored_rows.append({**vrow.to_dict(), "Ignored Reason": "£0 vendor line ignored"})
             continue
+
         best, score, reason = find_best_match(vrow, pas_df)
         status = "Unmatched"
         result_reason = "No live PAS item found"
         fleet_mismatch = False
-        duplicate_problem = False
+
         if best is not None:
-            desc_ok = similarity(vrow.get("Vendor Description", ""), best.get("PAS Description", "")) >= 0.42
+            desc_score = similarity(vrow.get("Vendor Description", ""), best.get("PAS Description", ""))
+            desc_ok = desc_score >= 0.25
             job_ok = True
             vjob = clean_cell(vrow.get("Vendor Job", ""))
             pjob = clean_cell(best.get("PAS Job Base", "")) or extract_job(best.get("PAS Job No", ""))
             if vjob and pjob:
                 job_ok = vjob.upper() == pjob.upper()
+
+            # If the PO/job is right, allow vague descriptions and accessory lines to group
+            # against the same PAS hire item. This stops hoses, leads, blades, batteries etc.
+            # being split out as false unmatches when they form part of one vendor hire item.
+            job_based_match = bool(vjob and pjob and vjob.upper() == pjob.upper() and score >= 15)
+
             if is_operated_plant_text(vrow.get("Vendor Description", ""), best.get("PAS Description", ""), best.get("PAS Status", "")):
                 status = "Unmatched"
                 result_reason = "Operated plant"
-            elif not is_effectively_live_pas_row(best):
-                status = "Unmatched"
+            elif not pas_item_live_as_of(best, as_of_date):
                 if is_off_hired_status(best.get("PAS Status", "")):
-                    result_reason = "PAS item is off-hired"
+                    result_reason = off_hire_reason(best, as_of_date)
                 else:
                     result_reason = "No live PAS item found"
             elif not job_ok:
                 status = "Unmatched"
                 result_reason = "Wrong/missing PO with no sensible match"
-            elif score < 36 or not desc_ok:
+            elif score < 20 and not desc_ok and not job_based_match:
                 status = "Unmatched"
                 result_reason = "No live PAS item found"
             else:
-                key = (clean_cell(best.get("PAS Row No", "")), normalise_text(vrow.get("Vendor Description", "")), clean_cell(vrow.get("Vendor Order No", "")))
-                if key in seen_keys:
-                    duplicate_problem = True
-                seen_keys.add(key)
-                if duplicate_problem:
-                    status = "Unmatched"
-                    result_reason = "Duplicate/problem item"
-                else:
-                    status = "Matched"
-                    result_reason = "Live PAS item found"
+                status = "Matched"
+                result_reason = "Live PAS item found"
                 vfleet = normalise_fleet(vrow.get("Vendor Fleet No", ""))
                 pfleet = normalise_fleet(best.get("PAS Fleet No", ""))
                 fleet_mismatch = bool(vfleet and pfleet and vfleet != pfleet)
+
         record = {
             "Status": status,
             "Reason": result_reason,
@@ -893,8 +910,8 @@ if vendor_file and orders_file:
     st.markdown(
         """
         <style>
-        /* Hide Streamlit uploader boxes once both documents are selected.
-           The PAS file cards above remain visible. */
+        /* Hide Streamlit's black uploaded-file chips once both files are selected.
+           Keep the PAS file cards visible. */
         div[data-testid="stFileUploader"] {
             display: none !important;
             visibility: hidden !important;
