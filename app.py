@@ -839,7 +839,7 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
         "Vendor Qty": find_col(cols, ["Quantity", "Qty"]),
         "Vendor On Hire Date": find_col(cols, ["Date", "On Hire Date", "Start Date", "Delivery Date", "Hired Date"]),
         "Vendor Contract No": find_col(cols, ["Syrinx Contract No", "Contract No", "Contract", "Hire Contract"]),
-        "Vendor Order No": find_col(cols, ["Order No", "PO", "Purchase Order", "Order Number", "Customer Order"]),
+        "Vendor Order No": find_col(cols, ["Order No", "Order Number", "PO", "PO No", "Purchase Order", "Purchase Order No", "Customer Order", "Customer Order No", "Your Ref", "Reference"]),
         "Vendor Rate": find_col(cols, ["Hire Rate", "Rate", "Weekly Rate", "Cost", "Value", "Charge", "Amount", "Net Weekly"]),
     }
     out = pd.DataFrame()
@@ -854,6 +854,7 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     out["Vendor Rate Value"] = out.get("Vendor Rate", "").apply(money_to_float) if isinstance(out.get("Vendor Rate", ""), pd.Series) else None
     out["Vendor Job"] = out.get("Vendor Order No", "").apply(extract_job) if isinstance(out.get("Vendor Order No", ""), pd.Series) else ""
     out["Vendor Hire No"] = out.get("Vendor Order No", "").apply(extract_hire_no) if isinstance(out.get("Vendor Order No", ""), pd.Series) else ""
+    out["Vendor Hire Ref"] = out.get("Vendor Order No", "").apply(extract_hire_ref) if isinstance(out.get("Vendor Order No", ""), pd.Series) else ""
     out["Vendor Row No"] = range(2, len(out) + 2)
     return raw, out
 
@@ -876,11 +877,21 @@ def load_pas_plant(uploaded_file) -> pd.DataFrame:
     out["PAS Off Hire Date"] = pick(["Off Hire Date", "Off-Hire Date"])
     out["PAS Status"] = pick(["Status"])
     out["PAS Job No"] = pick(["Job No", "Job Number", "Job"])
-    out["PAS Order Number"] = pick(["Order Number", "Sage Order No", "PO", "Purchase Order"])
+    out["PAS Order Number"] = pick(["Order Number", "Order No", "Sage Order No", "PO", "PO No", "Purchase Order", "Purchase Order No", "Customer Order", "Customer Order No"])
     out["PAS Site Name"] = pick(["Site Name", "Site"])
     out["PAS Row No"] = range(2, len(out) + 2)
     out["PAS Job Base"] = out["PAS Job No"].apply(extract_job)
-    out["PAS Hire Ref"] = out["PAS Order Number"].apply(extract_hire_ref)
+
+    def extract_pas_hire_ref(row):
+        # H references can appear in different places depending on the report/source.
+        # Use the first H number found and make it the hard matching key.
+        for field in ["PAS Order Number", "PAS Job No", "PAS Description"]:
+            found = extract_hire_ref(row.get(field, ""))
+            if found:
+                return found
+        return ""
+
+    out["PAS Hire Ref"] = out.apply(extract_pas_hire_ref, axis=1)
     out["PAS Hire No"] = out["PAS Hire Ref"].apply(lambda x: x[1:] if x else "")
     return out
 
