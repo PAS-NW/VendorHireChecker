@@ -514,6 +514,9 @@ def normalise_text(value) -> str:
         "stihl saw": "cut off saw", "stihl": "cut off saw", "disc cutter": "cut off saw",
         "telehandler": "telehandler", "fork lift": "forklift", "fork-lift": "forklift",
         "welfare cabin": "welfare unit", "site cabin": "welfare unit", "cabin": "welfare unit",
+        "10ft steel store": "10ft container", "20ft steel store": "20ft container",
+        "steel store": "container", "site store": "container", "storage container": "container",
+        "shipping container": "container", "store unit": "container",
         "gen set": "generator", "genny": "generator",
         "qty": "quantity",
     }
@@ -549,8 +552,18 @@ def extract_job(value) -> str:
 
 def extract_hire_no(value) -> str:
     text = clean_cell(value)
+    h = extract_hire_ref(text)
+    if h:
+        return h[1:]
     m = re.search(r"\b(\d{4,8})\b", text)
     return m.group(1) if m else ""
+
+
+def extract_hire_ref(value) -> str:
+    """Return H reference such as H6020 from an order/reference string."""
+    text = clean_cell(value).upper()
+    m = re.search(r"\bH\s*[-/]?\s*(\d{3,8})\b", text)
+    return f"H{m.group(1)}" if m else ""
 
 
 def normalise_fleet(value) -> str:
@@ -805,6 +818,7 @@ def parse_vendor_live_hire_pdf(uploaded_file) -> pd.DataFrame:
     out["Vendor Rate Value"] = out["Vendor Rate"].apply(money_to_float)
     out["Vendor Job"] = out["Vendor Order No"].apply(extract_job)
     out["Vendor Hire No"] = out["Vendor Order No"].apply(extract_hire_no)
+    out["Vendor Hire Ref"] = out["Vendor Order No"].apply(extract_hire_ref)
     out["Vendor Row No"] = range(2, len(out) + 2)
     return out
 
@@ -866,6 +880,8 @@ def load_pas_plant(uploaded_file) -> pd.DataFrame:
     out["PAS Site Name"] = pick(["Site Name", "Site"])
     out["PAS Row No"] = range(2, len(out) + 2)
     out["PAS Job Base"] = out["PAS Job No"].apply(extract_job)
+    out["PAS Hire Ref"] = out["PAS Order Number"].apply(extract_hire_ref)
+    out["PAS Hire No"] = out["PAS Hire Ref"].apply(lambda x: x[1:] if x else "")
     return out
 
 
@@ -874,16 +890,68 @@ def vendor_zero_cost(vrow) -> bool:
     return val is not None and not pd.isna(val) and abs(float(val)) < 0.0001
 
 
+def vendor_match_description(vrow) -> str:
+    group_desc = clean_cell(vrow.get("Vendor Group Description", ""))
+    return group_desc or clean_cell(vrow.get("Vendor Description", ""))
+
+
+def build_vendor_groups(vendor_df: pd.DataFrame) -> pd.DataFrame:
+    """Group related vendor lines before matching.
+
+    This keeps lines such as "10ft Steel Store" + "Padlock" together when they
+    share the same order/contract, so they can match one PAS line like
+    "Container: 10ft & Padlock".
+    """
+    if vendor_df.empty:
+        return vendor_df
+    df = vendor_df.copy()
+    for col in ["Vendor Order No", "Vendor Contract No", "Vendor Description"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    def group_key(row):
+        order = clean_cell(row.get("Vendor Order No", "")).upper()
+        contract = clean_cell(row.get("Vendor Contract No", "")).upper()
+        if order or contract:
+            return f"{order}|{contract}"
+        return f"ROW|{row.name}"
+
+    df["_Vendor Group Key"] = df.apply(group_key, axis=1)
+    group_desc_map = {}
+    group_count_map = {}
+    for key, grp in df.groupby("_Vendor Group Key", sort=False):
+        descriptions = []
+        for value in grp["Vendor Description"].tolist():
+            cleaned = clean_cell(value)
+            if cleaned and cleaned not in descriptions:
+                descriptions.append(cleaned)
+        group_desc_map[key] = " + ".join(descriptions)
+        group_count_map[key] = len(grp)
+    df["Vendor Group Description"] = df["_Vendor Group Key"].map(group_desc_map)
+    df["Vendor Group Line Count"] = df["_Vendor Group Key"].map(group_count_map)
+    return df
+
+
 def score_candidate(vrow, prow) -> Tuple[float, List[str]]:
     reasons = []
-    score = similarity(vrow.get("Vendor Description", ""), prow.get("PAS Description", "")) * 75
+    match_desc = vendor_match_description(vrow)
+    score = similarity(match_desc, prow.get("PAS Description", "")) * 75
+
+    vhire = clean_cell(vrow.get("Vendor Hire Ref", "")) or ("H" + clean_cell(vrow.get("Vendor Hire No", "")) if clean_cell(vrow.get("Vendor Hire No", "")) else "")
+    phire = clean_cell(prow.get("PAS Hire Ref", "")) or ("H" + clean_cell(prow.get("PAS Hire No", "")) if clean_cell(prow.get("PAS Hire No", "")) else "")
+    if vhire and phire and vhire.upper() == phire.upper():
+        score += 45
+        reasons.append("H number matched")
+
     vjob = clean_cell(vrow.get("Vendor Job", ""))
     pjob = clean_cell(prow.get("PAS Job Base", "")) or extract_job(prow.get("PAS Job No", ""))
-    if vjob and pjob and vjob == pjob:
+    if vjob and pjob and vjob.upper() == pjob.upper():
         score += 20
         reasons.append("Job/PO base matched")
-    elif vjob and pjob and vjob != pjob:
-        score -= 15
+    elif vjob and pjob and vjob.upper() != pjob.upper():
+        score -= 100
+        reasons.append("Job/PO base rejected")
+
     vfleet = normalise_fleet(vrow.get("Vendor Fleet No", ""))
     pfleet = normalise_fleet(prow.get("PAS Fleet No", ""))
     if vfleet and pfleet and vfleet == pfleet:
@@ -895,12 +963,26 @@ def score_candidate(vrow, prow) -> Tuple[float, List[str]]:
 def find_best_match(vrow, pas_df: pd.DataFrame) -> Tuple[Optional[pd.Series], float, str]:
     if pas_df.empty:
         return None, 0.0, "No PAS rows loaded"
+
     candidates = pas_df.copy()
+    vhire_ref = clean_cell(vrow.get("Vendor Hire Ref", ""))
+    if not vhire_ref and clean_cell(vrow.get("Vendor Hire No", "")):
+        vhire_ref = "H" + clean_cell(vrow.get("Vendor Hire No", ""))
     vjob = clean_cell(vrow.get("Vendor Job", ""))
-    if vjob:
+
+    # Hard gate 1: if the vendor gives an H number, never match against a different H number.
+    if vhire_ref:
+        hire_matches = candidates[candidates.get("PAS Hire Ref", pd.Series(dtype=str)).fillna("").astype(str).str.upper().eq(vhire_ref.upper())]
+        if hire_matches.empty:
+            return None, 0.0, f"No PAS row found with {vhire_ref}"
+        candidates = hire_matches
+    # Hard gate 2: if no H number is available but a P/job base is available, stay inside that job.
+    elif vjob:
         job_matches = candidates[candidates["PAS Job Base"].fillna("").astype(str).str.upper().eq(vjob.upper())]
-        if not job_matches.empty:
-            candidates = job_matches
+        if job_matches.empty:
+            return None, 0.0, f"No PAS row found for {vjob}"
+        candidates = job_matches
+
     best = None
     best_score = -999.0
     best_reason = ""
@@ -917,6 +999,7 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
     checked_rows = []
     ignored_rows = []
     as_of_date = datetime.now().date()
+    vendor_df = build_vendor_groups(vendor_df)
 
     for _, vrow in vendor_df.iterrows():
         if vendor_zero_cost(vrow):
@@ -925,35 +1008,42 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
 
         best, score, reason = find_best_match(vrow, pas_df)
         status = "Unmatched"
-        result_reason = "No live PAS item found"
+        result_reason = reason or "No live PAS item found"
         fleet_mismatch = False
 
         if best is not None:
-            desc_score = similarity(vrow.get("Vendor Description", ""), best.get("PAS Description", ""))
+            match_desc = vendor_match_description(vrow)
+            desc_score = similarity(match_desc, best.get("PAS Description", ""))
             desc_ok = desc_score >= 0.25
-            job_ok = True
+
             vjob = clean_cell(vrow.get("Vendor Job", ""))
             pjob = clean_cell(best.get("PAS Job Base", "")) or extract_job(best.get("PAS Job No", ""))
+            job_ok = True
             if vjob and pjob:
                 job_ok = vjob.upper() == pjob.upper()
 
-            # If the PO/job is right, allow vague descriptions and accessory lines to group
-            # against the same PAS hire item. This stops hoses, leads, blades, batteries etc.
-            # being split out as false unmatches when they form part of one vendor hire item.
-            job_based_match = bool(vjob and pjob and vjob.upper() == pjob.upper() and score >= 15)
+            vhire = clean_cell(vrow.get("Vendor Hire Ref", "")) or ("H" + clean_cell(vrow.get("Vendor Hire No", "")) if clean_cell(vrow.get("Vendor Hire No", "")) else "")
+            phire = clean_cell(best.get("PAS Hire Ref", "")) or ("H" + clean_cell(best.get("PAS Hire No", "")) if clean_cell(best.get("PAS Hire No", "")) else "")
+            hire_ok = True
+            if vhire and phire:
+                hire_ok = vhire.upper() == phire.upper()
 
-            if is_operated_plant_text(vrow.get("Vendor Description", ""), best.get("PAS Description", ""), best.get("PAS Status", "")):
+            # If the H number or P/job is right, allow vague/grouped descriptions.
+            # This covers accessories/package lines such as Steel Store + Padlock -> Container & Padlock.
+            gated_match = bool((vhire and phire and hire_ok) or (vjob and pjob and job_ok))
+
+            if is_operated_plant_text(vrow.get("Vendor Description", ""), match_desc, best.get("PAS Description", ""), best.get("PAS Status", "")):
                 status = "Unmatched"
                 result_reason = "Operated plant"
+            elif not hire_ok or not job_ok:
+                status = "Unmatched"
+                result_reason = "Wrong/missing PO with no sensible match"
             elif not pas_item_live_as_of(best, as_of_date):
                 if is_off_hired_status(best.get("PAS Status", "")):
                     result_reason = off_hire_reason(best, as_of_date)
                 else:
                     result_reason = "No live PAS item found"
-            elif not job_ok:
-                status = "Unmatched"
-                result_reason = "Wrong/missing PO with no sensible match"
-            elif score < 20 and not desc_ok and not job_based_match:
+            elif score < 20 and not desc_ok and not gated_match:
                 status = "Unmatched"
                 result_reason = "No live PAS item found"
             else:
@@ -973,6 +1063,8 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
             "Vendor Contract No": vrow.get("Vendor Contract No", ""),
             "Vendor Fleet No": vrow.get("Vendor Fleet No", ""),
             "Vendor Description": vrow.get("Vendor Description", ""),
+            "Vendor Group Description": vrow.get("Vendor Group Description", ""),
+            "Vendor Group Line Count": vrow.get("Vendor Group Line Count", ""),
             "Vendor Qty": vrow.get("Vendor Qty", ""),
             "Vendor On Hire Date": vrow.get("Vendor On Hire Date", ""),
             "PAS Job No": best.get("PAS Job No", "") if best is not None else "",
