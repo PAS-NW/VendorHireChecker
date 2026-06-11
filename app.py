@@ -630,6 +630,14 @@ def off_hire_reason(prow, as_of_date=None) -> str:
 
 def read_excel_any(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        # Vendor reports sometimes arrive as CSV. Try normal UTF-8 first, then
+        # fall back to common Windows encoding if the supplier export needs it.
+        try:
+            return pd.read_csv(uploaded_file)
+        except UnicodeDecodeError:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding="latin1")
     if name.endswith(".xls"):
         return pd.read_excel(uploaded_file, engine="xlrd")
     return pd.read_excel(uploaded_file)
@@ -1168,7 +1176,7 @@ def render_results_table(df: pd.DataFrame):
 up_col1, up_col2 = st.columns(2)
 with up_col1:
     st.markdown('<div class="pas-upload-card"><div class="pas-upload-title">Upload Vendor Hire Report</div>', unsafe_allow_html=True)
-    vendor_file = st.file_uploader("Upload Vendor Hire Report", type=["xlsx", "xls", "pdf"], label_visibility="collapsed", key="vendor_upload")
+    vendor_file = st.file_uploader("Upload Vendor Hire Report", type=["xlsx", "xls", "csv", "pdf"], label_visibility="collapsed", key="vendor_upload")
     if vendor_file:
         render_selected_file_card(vendor_file, "excel")
     st.markdown('</div>', unsafe_allow_html=True)
