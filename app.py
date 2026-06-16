@@ -1115,16 +1115,20 @@ def reconcile(vendor_df: pd.DataFrame, pas_df: pd.DataFrame) -> Tuple[pd.DataFra
                 status = "Unmatched"
                 result_reason = "No live PAS item found"
             else:
-                status = "Matched"
-                result_reason = "Live PAS item found"
                 vfleet = normalise_fleet(vrow.get("Vendor Fleet No", ""))
                 pfleet = normalise_fleet(best.get("PAS Fleet No", ""))
-                fleet_mismatch = bool(vfleet and pfleet and vfleet != pfleet)
+                fleet_mismatch = bool((vfleet and pfleet and vfleet != pfleet) or not pfleet)
+                if fleet_mismatch:
+                    status = "Unmatched"
+                    result_reason = "fleet number mismatch or missing"
+                else:
+                    status = "Matched"
+                    result_reason = "Live PAS item found"
 
         record = {
             "Status": status,
             "Reason": result_reason,
-            "Fleet Mismatch": "Yes" if fleet_mismatch and status == "Matched" else "",
+            "Fleet Mismatch": "Yes" if fleet_mismatch else "",
             "Match Score": round(float(score), 1),
             "Vendor Site": vrow.get("Vendor Site", ""),
             "Vendor Order No": vrow.get("Vendor Order No", ""),
