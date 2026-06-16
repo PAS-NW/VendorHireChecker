@@ -638,9 +638,58 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
         except UnicodeDecodeError:
             uploaded_file.seek(0)
             return pd.read_csv(uploaded_file, encoding="latin1")
-    if name.endswith(".xls"):
-        return pd.read_excel(uploaded_file, engine="xlrd")
-    return pd.read_excel(uploaded_file)
+
+    # Excel vendor reports can contain a Summary tab before the actual converted
+    # hire lines. Pick the sheet that looks most like a hire report, not simply
+    # the first worksheet. This fixes converted PDF outputs with sheets like
+    # Summary + Converted Report.
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    engine = "xlrd" if name.endswith(".xls") else None
+    xls = pd.ExcelFile(uploaded_file, engine=engine) if engine else pd.ExcelFile(uploaded_file)
+
+    best_df = None
+    best_score = -999
+    first_df = None
+
+    for sheet_name in xls.sheet_names:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name).dropna(how="all")
+        except Exception:
+            continue
+        if first_df is None:
+            first_df = df
+        if df.empty:
+            continue
+
+        cols = list(df.columns)
+        score = 0
+        if find_col(cols, ["Description", "Item Description", "Product", "Equipment", "Plant Description", "Name"]):
+            score += 5
+        if find_col(cols, ["Order No", "Order Number", "PO", "PO No", "Purchase Order", "Purchase Order No", "Customer Order", "Customer Order No", "Your Ref", "Reference"]):
+            score += 5
+        if find_col(cols, ["Net Weekly", "Weekly Rate", "Hire Rate", "Rate", "Cost", "Value", "Charge", "Amount"]):
+            score += 4
+        if find_col(cols, ["Fleet / Stock No", "Stock No", "Stock Number", "Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]):
+            score += 3
+        if find_col(cols, ["Contract No", "Contract", "Hire Contract", "Syrinx Contract No"]):
+            score += 2
+        if find_col(cols, ["On Hire Date", "Date", "Start Date", "Delivery Date", "Hired Date"]):
+            score += 2
+        if find_col(cols, ["Quantity", "Qty"]):
+            score += 2
+        score += min(len(df), 10) / 10
+        if "summary" in str(sheet_name).lower():
+            score -= 8
+
+        if score > best_score:
+            best_score = score
+            best_df = df
+
+    return best_df if best_df is not None and best_score > 0 else (first_df if first_df is not None else pd.DataFrame())
 
 
 
@@ -842,13 +891,13 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cols = list(raw.columns)
     mapping = {
         "Vendor Site": find_col(cols, ["Site", "Location", "Project", "Job", "Site Name"]),
-        "Vendor Fleet No": find_col(cols, ["Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]),
+        "Vendor Fleet No": find_col(cols, ["Fleet / Stock No", "Stock No", "Stock Number", "Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]),
         "Vendor Description": find_col(cols, ["Description", "Item Description", "Product", "Equipment", "Plant Description", "Name"]),
         "Vendor Qty": find_col(cols, ["Quantity", "Qty"]),
         "Vendor On Hire Date": find_col(cols, ["Date", "On Hire Date", "Start Date", "Delivery Date", "Hired Date"]),
         "Vendor Contract No": find_col(cols, ["Syrinx Contract No", "Contract No", "Contract", "Hire Contract"]),
         "Vendor Order No": find_col(cols, ["Order No", "Order Number", "PO", "PO No", "Purchase Order", "Purchase Order No", "Customer Order", "Customer Order No", "Your Ref", "Reference"]),
-        "Vendor Rate": find_col(cols, ["Hire Rate", "Rate", "Weekly Rate", "Cost", "Value", "Charge", "Amount", "Net Weekly"]),
+        "Vendor Rate": find_col(cols, ["Net Weekly", "Weekly Rate", "Hire Rate", "Rate", "Cost", "Value", "Charge", "Amount"]),
     }
     out = pd.DataFrame()
     for new_col, old_col in mapping.items():
