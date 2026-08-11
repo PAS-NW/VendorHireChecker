@@ -673,7 +673,7 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
             score += 5
         if find_col(cols, ["Net Weekly", "Weekly Rate", "Hire Rate", "Rate", "Cost", "Value", "Charge", "Amount"]):
             score += 4
-        if find_col(cols, ["Fleet / Stock No", "Stock No", "Stock Number", "Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]):
+        if find_col(cols, ["Fleet / Stock No", "Stock No", "Stock Number", "Unit No", "Unit Number", "Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]):
             score += 3
         if find_col(cols, ["Contract No", "Contract", "Hire Contract", "Syrinx Contract No"]):
             score += 2
@@ -690,6 +690,36 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
             best_df = df
 
     return best_df if best_df is not None and best_score > 0 else (first_df if first_df is not None else pd.DataFrame())
+
+
+def looks_like_pas_orders_workbook(uploaded_file) -> bool:
+    """Identify the PAS Materials & Plant workbook without relying on upload order."""
+    name = clean_cell(getattr(uploaded_file, "name", "")).lower()
+    if not name.endswith((".xlsx", ".xlsm", ".xls")):
+        return False
+
+    try:
+        uploaded_file.seek(0)
+        xls = pd.ExcelFile(uploaded_file)
+        plant_sheet = next((sheet for sheet in xls.sheet_names if norm_header(sheet) == "plant"), None)
+        if not plant_sheet:
+            return False
+
+        probe = pd.read_excel(xls, sheet_name=plant_sheet, nrows=2)
+        cols = list(probe.columns)
+        return all([
+            find_col(cols, ["Description", "Item Description", "Plant Description"]),
+            find_col(cols, ["Status"]),
+            find_col(cols, ["Job No", "Job Number", "Job"]),
+            find_col(cols, ["Order Number", "Order No", "Sage Order No", "PO", "PO No"]),
+        ])
+    except Exception:
+        return False
+    finally:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
 
 
 
@@ -891,7 +921,7 @@ def load_vendor_report(uploaded_file) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cols = list(raw.columns)
     mapping = {
         "Vendor Site": find_col(cols, ["Site", "Location", "Project", "Job", "Site Name"]),
-        "Vendor Fleet No": find_col(cols, ["Fleet / Stock No", "Stock No", "Stock Number", "Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]),
+        "Vendor Fleet No": find_col(cols, ["Fleet / Stock No", "Stock No", "Stock Number", "Unit No", "Unit Number", "Item No", "Fleet No", "Fleet", "Asset", "Serial", "Plant No", "Registration"]),
         "Vendor Description": find_col(cols, ["Description", "Item Description", "Product", "Equipment", "Plant Description", "Name"]),
         "Vendor Qty": find_col(cols, ["Quantity", "Qty"]),
         "Vendor On Hire Date": find_col(cols, ["Date", "On Hire Date", "Start Date", "Delivery Date", "Hired Date"]),
@@ -1270,10 +1300,15 @@ if run:
         st.warning("Please upload both the vendor hire report and the Material & Plant Orders workbook.")
         st.stop()
     try:
+        vendor_input = vendor_file
+        orders_input = orders_file
+        if looks_like_pas_orders_workbook(vendor_file) and not looks_like_pas_orders_workbook(orders_file):
+            vendor_input, orders_input = orders_file, vendor_file
+
         with st.spinner("Reading vendor hire report..."):
-            raw_vendor, vendor_df = load_vendor_report(vendor_file)
+            raw_vendor, vendor_df = load_vendor_report(vendor_input)
         with st.spinner("Reading PAS Material & Plant Orders..."):
-            pas_df = load_pas_plant(orders_file)
+            pas_df = load_pas_plant(orders_input)
         with st.spinner("Checking whether vendor items are still live on PAS report..."):
             checked_df, ignored_df = reconcile(vendor_df, pas_df)
         if checked_df.empty:
